@@ -1,0 +1,28 @@
+{
+  "schemaVersion": "authority-flip.manifest.v1",
+  "datasetId": "agent-authority-one-fact-v1",
+  "description": "Pinned one-fact agent-authority contrasts. CI checks sha256 of pairs.jsonl against this manifest. Do not regenerate the pairs in CI.",
+  "algorithm": "sha256",
+  "pairsFile": "pairs.jsonl",
+  "sha256": "23bc8fd440815bd2dd83f8e57032ffef6ec712a30e3a1d1b553fd223d1577548",
+  "bytes": 9270,
+  "pairCount": 16,
+  "pairIds": [
+    "af-001",
+    "af-002",
+    "af-003",
+    "af-004",
+    "af-005",
+    "af-006",
+    "af-007",
+    "af-008",
+    "af-009",
+    "af-010",
+    "af-011",
+    "af-012",
+    "af-013",
+    "af-014",
+    "af-015",
+    "af-016"
+  ]
+}

@@ -2,7 +2,7 @@
   "name": "authority-flip",
   "version": "0.0.0",
   "private": true,
-  "description": "Stub for the contrastive authority-flip harness. No metrics yet.",
+  "description": "Integrity-pinned contrastive flip harness for agent authority. Reports flip rate and ECE. Not a sandbox and not open Jev.",
   "license": "MIT",
   "type": "module",
   "exports": {
