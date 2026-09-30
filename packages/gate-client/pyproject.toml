@@ -1,10 +1,15 @@
 [project]
 name = "gate-client"
-version = "0.0.0"
-description = "Empty Python stub for the System-1 gate client. No SDK wiring."
+version = "0.1.0"
+description = "System-1 gate client. TypeSafe Python SDK against local Ollama Nimble. Fail-closed deny."
 requires-python = ">=3.11"
 license = "MIT"
-dependencies = []
+dependencies = [
+  "typesafe-sdk>=0.7.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
 
 [build-system]
 requires = ["setuptools>=61"]
@@ -12,3 +17,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+gate_client = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
