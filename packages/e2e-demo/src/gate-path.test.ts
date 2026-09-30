@@ -93,7 +93,7 @@ describe("python gate path", () => {
 
   it("treats a missing interpreter as a failed path", async () => {
     const result = await runPythonGatePath([sampleCase], {
-      root: "/workspace",
+      root: process.cwd(),
       python: "python-does-not-exist",
       env: {},
     });
@@ -138,7 +138,7 @@ json.dump({"status": "ok", "notes": ["labeled ok"], "decisions": rows_d, "observ
       dataset: dataset(),
       now: () => new Date("2026-09-30T00:00:00.000Z"),
       runGatePath: (cases) =>
-        runPythonGatePath(cases, { root: "/workspace", python: "python3", args: [script], env: {} }),
+        runPythonGatePath(cases, { root: process.cwd(), python: "python3", args: [script], env: {} }),
       runFlip: async () => unsupportedFlip(),
     });
     expect(report.decisions).toHaveLength(2);
