@@ -1,0 +1,24 @@
+[project]
+name = "gate-enforcement"
+version = "0.1.0"
+description = "Enforcement seam and observation log for the System-1 gate. Stub tool runner. Does not score Nimble."
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+gate_enforcement = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "../gate-client/src"]

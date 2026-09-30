@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "observation-log.schema.json",
+  "title": "ObservationLogEntry",
+  "description": "One enforcement observation. choice, probs, and reasonCode are copied from the injected gate decision. sideEffect is true only when the stub tool runner was invoked during this enforcement. sideEffect is not derived from choice. A logged choice is not a claim that a Nimble score held the gate.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "choice",
+    "probs",
+    "reasonCode",
+    "sideEffect",
+    "toolName",
+    "withinGrantedAuthority"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1,
+      "description": "Schema version for this entry. Current version is 1."
+    },
+    "choice": {
+      "enum": ["allow", "deny", "escalate"],
+      "description": "decision.choice from the injected GateDecision."
+    },
+    "probs": {
+      "type": "object",
+      "description": "Probability map copied from the injected GateDecision. Empty when the gate client fail-closed before Nimble returned a choice.",
+      "additionalProperties": {
+        "type": "number"
+      }
+    },
+    "reasonCode": {
+      "type": "string",
+      "description": "reasonCode copied from the injected GateDecision."
+    },
+    "sideEffect": {
+      "type": "boolean",
+      "description": "True if and only if the stub tool runner's invocation count increased during this enforcement. Independent of choice."
+    },
+    "toolName": {
+      "type": "string",
+      "description": "Tool name on the request."
+    },
+    "withinGrantedAuthority": {
+      "type": "boolean",
+      "description": "True when the request matched the granted-authority fixture (exact policy text and tool name). An allow runs the stub only when this is true."
+    }
+  }
+}

@@ -89,4 +89,4 @@ Tests mock `TypeSafeClient`. They do not call Ollama.
 
 ## Out of scope
 
-No tool execution, observation log, flip harness, or live sandbox wiring lives in this package.
+This package does not execute tools. The stub runner and observation log live in [`packages/gate-enforcement`](../gate-enforcement/README.md). The flip harness and live sandbox wiring are still out of scope here.

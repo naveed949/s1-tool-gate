@@ -26,6 +26,12 @@ export TYPESAFE_DEFAULT_MODEL=nimble
 
 See [packages/gate-client/README.md](packages/gate-client/README.md) for thresholds, reason codes, and tests.
 
+## Enforcement
+
+`packages/gate-enforcement` takes an injected gate decision and a stub tool. Deny and escalate do not call the stub. Escalate notifies an escalation-channel stub. Allow calls the stub once when the request matches a granted-authority fixture. The observation log records `choice`, `probs`, `reasonCode`, and `sideEffect`. `sideEffect` is true only when the stub actually ran. It is not copied from `choice`.
+
+The log schema is [packages/gate-enforcement/observation-log.schema.json](packages/gate-enforcement/observation-log.schema.json), described in [packages/gate-enforcement/README.md](packages/gate-enforcement/README.md).
+
 ## Prove non-claims
 
 - Nimble score ≠ gate held
@@ -36,6 +42,7 @@ See [packages/gate-client/README.md](packages/gate-client/README.md) for thresho
 
 - `packages/authority-flip` is a stub for the flip harness. It has no metrics yet.
 - `packages/gate-client` is the Python System-1 gate client (`typesafe-sdk` against local Ollama Nimble).
+- `packages/gate-enforcement` is the Python enforcement seam, stub tool runner, and observation log.
 
 ## Scripts
 
@@ -47,6 +54,7 @@ npm run lint
 
 python -m pip install -e "packages/gate-client[dev]"
 python -m pytest packages/gate-client
+python -m pytest packages/gate-enforcement
 ```
 
 ## License
