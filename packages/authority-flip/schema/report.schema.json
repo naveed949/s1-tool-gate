@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/naveed949/s1-tool-gate/packages/authority-flip/schema/report.schema.json",
+  "title": "authority-flip report",
+  "description": "Machine-readable flip rate and ECE report. status ok means every item was scored. It is not a quality threshold. unsupported and failed leave flipRate, rawFlipRate, ece, and calibration null so a missing backend cannot look like a pass.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "generatedAt", "dataset", "comparators"],
+  "properties": {
+    "schemaVersion": { "const": "authority-flip.report.v1" },
+    "generatedAt": { "type": "string", "format": "date-time" },
+    "dataset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "pairsFile", "sha256", "bytes", "pairCount"],
+      "properties": {
+        "id": { "type": "string" },
+        "pairsFile": { "type": "string" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "pairCount": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "comparators": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nimble-ollama", "base-qwen", "frontier-judge"],
+      "properties": {
+        "nimble-ollama": { "$ref": "#/$defs/comparator" },
+        "base-qwen": { "$ref": "#/$defs/comparator" },
+        "frontier-judge": { "$ref": "#/$defs/comparator" }
+      }
+    }
+  },
+  "$defs": {
+    "comparator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "flipRate", "rawFlipRate", "ece", "counts", "calibration", "notes"],
+      "properties": {
+        "status": { "enum": ["ok", "unsupported", "failed"] },
+        "flipRate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "rawFlipRate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "ece": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "counts": { "$ref": "#/$defs/counts" },
+        "calibration": {
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/calibration" }]
+        },
+        "notes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Residual notes: model or endpoint used, or why the comparator is unsupported or failed."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "ok" } }, "required": ["status"] },
+          "then": {
+            "properties": {
+              "flipRate": { "type": "number" },
+              "rawFlipRate": { "type": "number" },
+              "ece": { "type": "number" },
+              "calibration": { "$ref": "#/$defs/calibration" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "status": { "enum": ["unsupported", "failed"] } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "flipRate": { "type": "null" },
+              "rawFlipRate": { "type": "null" },
+              "ece": { "type": "null" },
+              "calibration": { "type": "null" }
+            }
+          }
+        }
+      ]
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pairs", "items", "scoredPairs", "correctFlips", "rawFlips", "scoredItems", "correctItems"],
+      "properties": {
+        "pairs": { "type": "integer", "minimum": 0 },
+        "items": { "type": "integer", "minimum": 0 },
+        "scoredPairs": { "type": "integer", "minimum": 0 },
+        "correctFlips": { "type": "integer", "minimum": 0 },
+        "rawFlips": { "type": "integer", "minimum": 0 },
+        "scoredItems": { "type": "integer", "minimum": 0 },
+        "correctItems": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "calibration": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "ECE uses 10 equal-width bins on [0, 1]. Bins 0-8 are [i/10, (i+1)/10). Bin 9 is [0.9, 1]. Confidence is the probability of the predicted choice. Empty bins have null accuracy and null meanConfidence and add 0 to ECE.",
+      "required": ["binCount", "bins"],
+      "properties": {
+        "binCount": { "const": 10 },
+        "bins": {
+          "type": "array",
+          "minItems": 10,
+          "maxItems": 10,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["index", "lower", "upper", "count", "accuracy", "meanConfidence"],
+            "properties": {
+              "index": { "type": "integer", "minimum": 0, "maximum": 9 },
+              "lower": { "type": "number" },
+              "upper": { "type": "number" },
+              "count": { "type": "integer", "minimum": 0 },
+              "accuracy": { "type": ["number", "null"] },
+              "meanConfidence": { "type": ["number", "null"] }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import * as authorityFlip from "./index.js";
+import { COMPARATOR_IDS, ECE_BIN_COUNT, runHarness, verifyPinnedDataset } from "./index.js";
 
 describe("authority-flip", () => {
-  it("loads the package stub", () => {
-    expect(authorityFlip).toBeDefined();
+  it("exports the pinned dataset check and the harness", () => {
+    expect(COMPARATOR_IDS).toEqual(["nimble-ollama", "base-qwen", "frontier-judge"]);
+    expect(ECE_BIN_COUNT).toBe(10);
+    expect(verifyPinnedDataset().ok).toBe(true);
+    expect(runHarness).toBeTypeOf("function");
   });
 });
