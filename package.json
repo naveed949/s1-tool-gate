@@ -9,14 +9,16 @@
     "node": ">=20"
   },
   "workspaces": [
-    "packages/authority-flip"
+    "packages/authority-flip",
+    "packages/e2e-demo"
   ],
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
     "authority-flip": "node --disable-warning=ExperimentalWarning --experimental-strip-types --import ./packages/authority-flip/src/register.mjs packages/authority-flip/src/cli.ts",
-    "authority-flip:verify": "node --disable-warning=ExperimentalWarning --experimental-strip-types --import ./packages/authority-flip/src/register.mjs packages/authority-flip/src/cli.ts verify"
+    "authority-flip:verify": "node --disable-warning=ExperimentalWarning --experimental-strip-types --import ./packages/authority-flip/src/register.mjs packages/authority-flip/src/cli.ts verify",
+    "e2e-demo": "node --disable-warning=ExperimentalWarning --experimental-strip-types --import ./packages/authority-flip/src/register.mjs packages/e2e-demo/src/cli.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

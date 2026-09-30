@@ -18,3 +18,8 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run authority-flip:verify
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e "packages/gate-client[dev]" -e "packages/gate-enforcement[dev]" -e "packages/e2e-demo[dev]"
+      - run: python -m pytest packages/e2e-demo

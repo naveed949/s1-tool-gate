@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/naveed949/s1-tool-gate/packages/e2e-demo/schema/report.schema.json",
+  "title": "e2e demo report",
+  "description": "Combined demo report. decisions are gate-client results. observations wrap observation-log entries. flip is an authority-flip.report.v1 document. flipSummary copies status, flip rate, and ECE from flip. A missing backend leaves those metrics null. gate.status ok means every decision reason is a Nimble choice. Nimble score ≠ gate held.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "generatedAt",
+    "nonClaims",
+    "dataset",
+    "gate",
+    "decisions",
+    "observations",
+    "flipSummary",
+    "flip"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "e2e-demo.report.v1" },
+    "generatedAt": { "type": "string", "format": "date-time" },
+    "nonClaims": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": false,
+      "prefixItems": [
+        { "const": "Nimble score ≠ gate held" },
+        { "const": "high noul ≠ safe" },
+        { "const": "this is not AdaptiveSandbox" },
+        { "const": "this is not open Jev" }
+      ]
+    },
+    "dataset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "pairsFile", "sha256", "bytes", "pairCount"],
+      "properties": {
+        "id": { "type": "string" },
+        "pairsFile": { "type": "string" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "pairCount": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "notes"],
+      "properties": {
+        "status": {
+          "enum": ["ok", "unavailable", "failed"],
+          "description": "ok means every decision reason is nimble_allow, nimble_deny, or nimble_escalate. unavailable means at least one decision is fail-closed. failed means the path did not return a usable row per case."
+        },
+        "notes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "decisions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/decisionRow" }
+    },
+    "observations": {
+      "type": "array",
+      "description": "One wrapper per decision. entry is an observation-log object and does not carry the pair id.",
+      "items": { "$ref": "#/$defs/observationRow" }
+    },
+    "flipSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Copy of comparator status and metrics from flip. Not computed from decisions.",
+      "required": ["nimble-ollama", "base-qwen", "frontier-judge"],
+      "properties": {
+        "nimble-ollama": { "$ref": "#/$defs/flipMetric" },
+        "base-qwen": { "$ref": "#/$defs/flipMetric" },
+        "frontier-judge": { "$ref": "#/$defs/flipMetric" }
+      }
+    },
+    "flip": {
+      "description": "Full authority-flip report. See packages/authority-flip/schema/report.schema.json.",
+      "$ref": "../../authority-flip/schema/report.schema.json"
+    }
+  },
+  "$defs": {
+    "decisionRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pairId", "side", "gold", "decision"],
+      "properties": {
+        "pairId": { "type": "string" },
+        "side": { "enum": ["base", "flipped"] },
+        "gold": { "enum": ["allow", "deny", "escalate"] },
+        "decision": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["choice", "probs", "reasonCode"],
+          "properties": {
+            "choice": { "enum": ["allow", "deny", "escalate"] },
+            "probs": {
+              "type": "object",
+              "additionalProperties": { "type": "number" }
+            },
+            "reasonCode": {
+              "enum": [
+                "nimble_allow",
+                "nimble_deny",
+                "nimble_escalate",
+                "fail_closed_low_confidence",
+                "fail_closed_timeout",
+                "fail_closed_down",
+                "fail_closed_cloud_misconfigured",
+                "fail_closed_sdk_error",
+                "fail_closed_invalid_response",
+                "fail_closed_invalid_config"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "observationRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pairId", "side", "entry"],
+      "properties": {
+        "pairId": { "type": "string" },
+        "side": { "enum": ["base", "flipped"] },
+        "entry": {
+          "description": "Canonical observation log entry from packages/gate-enforcement/observation-log.schema.json.",
+          "$ref": "../../gate-enforcement/observation-log.schema.json"
+        }
+      }
+    },
+    "flipMetric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "flipRate", "rawFlipRate", "ece"],
+      "properties": {
+        "status": { "enum": ["ok", "unsupported", "failed"] },
+        "flipRate": { "type": ["number", "null"] },
+        "rawFlipRate": { "type": ["number", "null"] },
+        "ece": { "type": ["number", "null"] }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "ok" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "flipRate": { "type": "number" },
+              "rawFlipRate": { "type": "number" },
+              "ece": { "type": "number" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "status": { "enum": ["unsupported", "failed"] } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "flipRate": { "type": "null" },
+              "rawFlipRate": { "type": "null" },
+              "ece": { "type": "null" }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

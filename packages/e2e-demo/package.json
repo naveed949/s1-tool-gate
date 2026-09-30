@@ -1,0 +1,11 @@
+{
+  "name": "e2e-demo",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Scripted demo that composes the gate client, enforcement seam, and authority-flip report. Not AdaptiveSandbox.",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}
