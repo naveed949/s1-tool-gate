@@ -1,0 +1,11 @@
+{
+  "name": "authority-flip",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Stub for the contrastive authority-flip harness. No metrics yet.",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}
