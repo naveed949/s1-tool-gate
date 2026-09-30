@@ -63,8 +63,42 @@ The report schema, the binning definition, and the commands are in [packages/aut
 - `packages/authority-flip` is the TypeScript flip harness: pinned pairs, flip rate, and ECE.
 - `packages/gate-client` is the Python System-1 gate client (`typesafe-sdk` against local Ollama Nimble).
 - `packages/gate-enforcement` is the Python enforcement seam, stub tool runner, and observation log.
+- `packages/e2e-demo` is the scripted demo that calls the three packages and writes one report.
 
-The flip harness does not call the gate client or the enforcement seam.
+The flip harness does not call the gate client or the enforcement seam. `packages/e2e-demo` is the scripted path that calls all three and prints one report.
+
+## Demo
+
+`npm run --silent e2e-demo` loads the pinned flip pairs, asks the gate client for a decision on each side, runs that decision through the enforcement seam and stub, and embeds the authority-flip report (flip rate and ECE). `--silent` keeps npm's script banner off stdout, so the process prints only the JSON report.
+
+Ollama **0.35 or newer** serves Nimble. The live command needs the Python packages installed once so the TypeSafe SDK imports:
+
+```bash
+export TYPESAFE_BASE_URL=http://localhost:11434
+export TYPESAFE_API_KEY=ollama
+export TYPESAFE_DEFAULT_MODEL=nimble
+python -m pip install -e packages/gate-client -e packages/gate-enforcement
+npm run --silent e2e-demo
+```
+
+The report schema is [`packages/e2e-demo/schema/report.schema.json`](packages/e2e-demo/schema/report.schema.json). It includes:
+
+- `decisions` — gate-client `{ choice, probs, reasonCode }` for each pair side
+- `observations` — one observation-log entry per side (`sideEffect` is whether the stub ran)
+- `flipSummary` and `flip` — flip rate and ECE from the authority-flip harness
+
+`npm test` covers this orchestrator with mocked gate, enforcement, and flip backends. It does not call Ollama. The block above is the live path.
+
+When Ollama is down the gate path is `unavailable` (`reasonCode` `fail_closed_down`, choice deny). Nimble and base Qwen in the flip section are `unsupported`, and their flip rate and ECE are null. The process exits non-zero. Those nulls are not replaced with a rate computed from the fail-closed denies.
+
+Exit 0 means every gate decision was a Nimble choice and every flip comparator, including base Qwen and the frontier judge, scored. A missing Qwen tag or a missing `AUTHORITY_FLIP_JUDGE_API_KEY` leaves that comparator `unsupported` and the exit code at 2. The report is still printed. Details, the fixture, and the exit table are in [packages/e2e-demo/README.md](packages/e2e-demo/README.md).
+
+The report repeats the Prove non-claims:
+
+- Nimble score ≠ gate held
+- high noul ≠ safe
+- this is not AdaptiveSandbox
+- this is not open Jev
 
 ## Scripts
 
@@ -75,10 +109,12 @@ npm run typecheck
 npm run lint
 npm run authority-flip:verify
 npm run authority-flip
+npm run --silent e2e-demo
 
-python -m pip install -e "packages/gate-client[dev]"
+python -m pip install -e "packages/gate-client[dev]" -e "packages/gate-enforcement[dev]" -e "packages/e2e-demo[dev]"
 python -m pytest packages/gate-client
 python -m pytest packages/gate-enforcement
+python -m pytest packages/e2e-demo
 ```
 
 ## License
