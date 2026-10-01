@@ -100,6 +100,12 @@ The report repeats the Prove non-claims:
 - this is not AdaptiveSandbox
 - this is not open Jev
 
+## Checked-in runs
+
+[`runs/`](runs/README.md) is the fail-closed eval snapshot reviewers can re-read without starting Ollama or Nimble. [`runs/fail-closed-unsupported.json`](runs/fail-closed-unsupported.json) is the review record. [`runs/e2e-demo-fail-closed.json`](runs/e2e-demo-fail-closed.json) is the `e2e-demo` stdout it was projected from.
+
+Nimble score ≠ gate held. Live flip/ECE was deferred until this artifact (no Soft-PASS substitute). On that missing-scorer run the decision is `unsupported`, the gate path is deny-closed, `flip_rate` and `ece` are null, and `soft_pass` is false. Soft-PASS was refused.
+
 ## Scripts
 
 ```bash
