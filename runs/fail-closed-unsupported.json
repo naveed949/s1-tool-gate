@@ -29,7 +29,8 @@
     "status": "unavailable",
     "notes": [
       "32 decision(s) fail-closed with fail_closed_down",
-      "Fail-closed decisions are recorded as deny. They are not scored Nimble choices. This path does not emit flip rate or ECE."
+      "Fail-closed decisions are recorded as deny. They are not scored Nimble choices. This path does not emit flip rate or ECE.",
+      "Soft-PASS refused."
     ]
   },
   "dataset": {

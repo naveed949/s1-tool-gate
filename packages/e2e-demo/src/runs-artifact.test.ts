@@ -59,6 +59,7 @@ interface PortfolioRecord {
   soft_pass: boolean;
   message: string;
   nimble: NimbleRecord;
+  gate: { status: string; notes: string[] };
   exitCode: number;
   source: string;
   nonClaims: string[];
@@ -99,6 +100,8 @@ describe("checked-in fail-closed run", () => {
     expect(portfolio.nimble.ece).toBeNull();
     expect(portfolio.nimble.soft_pass).toBe(false);
     expect(portfolio.nimble.message).toContain(REFUSAL);
+    expect(portfolio.gate.notes.join("\n")).toContain("Soft-PASS refused");
+    expect(source.gate.notes.join("\n")).not.toContain("Soft-PASS");
     expect(portfolio.nimble.flip_rate).toBe(source.flip.comparators["nimble-ollama"]?.flipRate);
     expect(portfolio.nimble.ece).toBe(source.flip.comparators["nimble-ollama"]?.ece);
   });
