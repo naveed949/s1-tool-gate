@@ -32,6 +32,31 @@ See [packages/gate-client/README.md](packages/gate-client/README.md) for thresho
 
 The log schema is [packages/gate-enforcement/observation-log.schema.json](packages/gate-enforcement/observation-log.schema.json), described in [packages/gate-enforcement/README.md](packages/gate-enforcement/README.md).
 
+## Claims gate (OIDC/OAuth in front of an MCP server)
+
+`packages/claims-gate` turns a verified access token into an allow / deny / escalate for one MCP tool call. It checks the signature against a JWKS, then `iss`, `aud`, `exp`/`nbf`, `sub`, and `scope`. The scopes map onto a tool policy. It returns the same `GateDecision` shape as the gate client, so `gate-enforcement` runs it unchanged. It ships a kaia-mcp fixture (`kaia:read`, `kaia:encode`, `kaia:wallet`, copied from kaia-mcp `db76732`) and 22 golden evals. Details are in [packages/claims-gate/README.md](packages/claims-gate/README.md).
+
+### Wiring it in front of an MCP server
+
+1. Terminate the partner's MCP HTTP request at a proxy or middleware you control. Read `Authorization` and the JSON-RPC `tools/call` name.
+2. Build one `ClaimsGate` per resource server. Use `VerifierConfig(jwks=<your IdP JWKS>, issuer=<exact issuer>, audience=<this MCP server's audience>)` and a `ToolPolicy` that maps every exposed tool to its scope. `kaia_policy()` is the kaia-mcp map. List wallet or fund-moving tools in `wallet_tools`.
+3. Call `gate.evaluate(authorization, tool_name)` before forwarding. Forward only on `allow`. On `escalate`, send the call to a human or higher-authority queue (`EscalationChannel`). On `deny`, return the MCP error without forwarding.
+4. If the System-1 Nimble gate also runs, pass both through `combine(claims, nimble)`. Claims are the ceiling. Nimble can narrow an allow but cannot widen a deny or an escalate.
+5. Enforce through `EnforcementSeam` so `sideEffect` is observed, not inferred.
+6. Keep the MCP server's own scope checks. Kaia-mcp still enforces its scopes itself. The gate is defense in depth, not a replacement.
+7. Refresh the JWKS from your IdP on rotation. An unknown `kid` denies.
+
+### Threat notes
+
+- **Forged or downgraded tokens.** Only RS256 and ES256 are accepted. `alg: none` and HS* are rejected, both in tokens and in `VerifierConfig`. This blocks the HS256-with-public-key confusion attack.
+- **Token replay to another API.** `aud` must contain this server's audience, and `iss` must match exactly.
+- **Stale tokens.** `exp` is required and checked with zero leeway by default. A future `nbf` denies.
+- **Scope creep.** An unknown tool denies. A missing scope denies. The map is explicit per tool, with no wildcards.
+- **Wallet and key material.** `generate_wallet` escalates even with `kaia:wallet`. `wallet_default` cannot be set to allow.
+- **Token leakage.** The gate never logs or returns the token. `decide` reads it from env or a file, never from argv.
+- **Fail-open fallbacks.** No path turns an error into an allow. A broken JWKS denies.
+- **Not covered.** Token revocation (introspection), DPoP or mTLS sender-constraining, and argument-level policy are not covered. A stolen unexpired token with the right scopes is allowed until `exp`. Keep token lifetimes short.
+
 ## Prove non-claims
 
 - Nimble score ≠ gate held
@@ -64,6 +89,7 @@ The report schema, the binning definition, and the commands are in [packages/aut
 - `packages/gate-client` is the Python System-1 gate client (`typesafe-sdk` against local Ollama Nimble).
 - `packages/gate-enforcement` is the Python enforcement seam, stub tool runner, and observation log.
 - `packages/e2e-demo` is the scripted demo that calls the three packages and writes one report.
+- `packages/claims-gate` is the Python OIDC/OAuth claims gate: verified token claims to allow / deny / escalate, with the kaia-mcp fixture and golden evals.
 
 The flip harness does not call the gate client or the enforcement seam. `packages/e2e-demo` is the scripted path that calls all three and prints one report.
 
@@ -117,7 +143,8 @@ npm run authority-flip:verify
 npm run authority-flip
 npm run --silent e2e-demo
 
-python -m pip install -e "packages/gate-client[dev]" -e "packages/gate-enforcement[dev]" -e "packages/e2e-demo[dev]"
+python -m pip install -e "packages/gate-client[dev]" -e "packages/gate-enforcement[dev]" -e "packages/e2e-demo[dev]" -e "packages/claims-gate[dev]"
+python -m pytest packages/claims-gate
 python -m pytest packages/gate-client
 python -m pytest packages/gate-enforcement
 python -m pytest packages/e2e-demo

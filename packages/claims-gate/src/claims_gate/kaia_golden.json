@@ -1,0 +1,30 @@
+{
+  "source": "naveed949/kaia-mcp@db76732:src/auth/scopes.ts",
+  "issuer": "https://idp.test.invalid",
+  "audience": "kaia-mcp",
+  "now": 1800000000,
+  "cases": [
+    {"id": "allow-read", "tool": "get_kaia_balance", "token": {"scope": "kaia:read"}, "expected": {"choice": "allow", "reasonCode": "claims_allow"}},
+    {"id": "allow-encode", "tool": "encode_function_data", "token": {"scope": "kaia:read kaia:encode"}, "expected": {"choice": "allow", "reasonCode": "claims_allow"}},
+    {"id": "allow-scp-list", "tool": "get_chain_info", "token": {"scp": ["kaia:read"]}, "expected": {"choice": "allow", "reasonCode": "claims_allow"}},
+    {"id": "deny-scope-encode", "tool": "encode_function_data", "token": {"scope": "kaia:read"}, "expected": {"choice": "deny", "reasonCode": "claims_insufficient_scope"}},
+    {"id": "deny-scope-read", "tool": "get_block", "token": {"scope": "kaia:encode"}, "expected": {"choice": "deny", "reasonCode": "claims_insufficient_scope"}},
+    {"id": "expired", "tool": "get_kaia_balance", "token": {"scope": "kaia:read", "expIn": -1}, "expected": {"choice": "deny", "reasonCode": "claims_expired"}},
+    {"id": "expired-at-boundary", "tool": "get_kaia_balance", "token": {"scope": "kaia:read", "expIn": 0}, "expected": {"choice": "deny", "reasonCode": "claims_expired"}},
+    {"id": "not-yet-valid", "tool": "get_kaia_balance", "token": {"scope": "kaia:read", "nbfIn": 60}, "expected": {"choice": "deny", "reasonCode": "claims_not_yet_valid"}},
+    {"id": "wrong-audience", "tool": "get_kaia_balance", "token": {"scope": "kaia:read", "aud": "some-other-api"}, "expected": {"choice": "deny", "reasonCode": "claims_audience_mismatch"}},
+    {"id": "wrong-issuer", "tool": "get_kaia_balance", "token": {"scope": "kaia:read", "iss": "https://evil.test.invalid"}, "expected": {"choice": "deny", "reasonCode": "claims_issuer_mismatch"}},
+    {"id": "unauthenticated", "tool": "get_kaia_balance", "token": null, "authorization": null, "expected": {"choice": "deny", "reasonCode": "claims_unauthenticated"}},
+    {"id": "non-bearer-scheme", "tool": "get_kaia_balance", "token": null, "authorization": "Basic dXNlcjpwYXNz", "expected": {"choice": "deny", "reasonCode": "claims_unauthenticated"}},
+    {"id": "malformed-token", "tool": "get_kaia_balance", "token": null, "authorization": "Bearer not-a-jwt", "expected": {"choice": "deny", "reasonCode": "claims_invalid_token"}},
+    {"id": "bad-signature", "tool": "get_kaia_balance", "token": {"scope": "kaia:read", "signer": "untrusted"}, "expected": {"choice": "deny", "reasonCode": "claims_invalid_token"}},
+    {"id": "alg-none", "tool": "get_kaia_balance", "token": {"scope": "kaia:read", "signer": "none"}, "expected": {"choice": "deny", "reasonCode": "claims_invalid_token"}},
+    {"id": "unknown-kid", "tool": "get_kaia_balance", "token": {"scope": "kaia:read", "kid": "rotated-away"}, "expected": {"choice": "deny", "reasonCode": "claims_invalid_token"}},
+    {"id": "missing-sub", "tool": "get_kaia_balance", "token": {"scope": "kaia:read", "omit": ["sub"]}, "expected": {"choice": "deny", "reasonCode": "claims_missing_claim"}},
+    {"id": "missing-exp", "tool": "get_kaia_balance", "token": {"scope": "kaia:read", "omit": ["exp"]}, "expected": {"choice": "deny", "reasonCode": "claims_missing_claim"}},
+    {"id": "missing-scope", "tool": "get_kaia_balance", "token": {}, "expected": {"choice": "deny", "reasonCode": "claims_missing_claim"}},
+    {"id": "unknown-tool", "tool": "transfer_kaia", "token": {"scope": "kaia:read kaia:encode kaia:wallet"}, "expected": {"choice": "deny", "reasonCode": "claims_unknown_tool"}},
+    {"id": "wallet-escalate", "tool": "generate_wallet", "token": {"scope": "kaia:read kaia:wallet"}, "expected": {"choice": "escalate", "reasonCode": "claims_wallet_escalate"}},
+    {"id": "wallet-without-scope", "tool": "generate_wallet", "token": {"scope": "kaia:read kaia:encode"}, "expected": {"choice": "deny", "reasonCode": "claims_insufficient_scope"}}
+  ]
+}
