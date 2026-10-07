@@ -223,3 +223,6 @@ dist/
 coverage/
 *.tsbuildinfo
 .eslintcache
+
+# verify-s1-tool-gate proof artifacts (per-run, local only)
+.cursor/skills/verify-s1-tool-gate/evidence/

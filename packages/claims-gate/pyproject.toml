@@ -1,0 +1,26 @@
+[project]
+name = "claims-gate"
+version = "0.1.0"
+description = "Deterministic OIDC/OAuth claims gate: verified token claims -> fail-closed allow/deny/escalate for MCP tool calls."
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+  "PyJWT[crypto]>=2.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+claims_gate = ["py.typed", "kaia_golden.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "../gate-client/src", "../gate-enforcement/src"]
