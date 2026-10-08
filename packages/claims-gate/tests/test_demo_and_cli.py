@@ -93,4 +93,19 @@ def test_proxy_cli_introspection_cache_defaults_off_and_is_opt_in() -> None:
 def test_proxy_cli_negative_drift_interval_refuses_to_start(capsys: pytest.CaptureFixture[str]) -> None:
     rc = main(["proxy", "--upstream", "http://127.0.0.1:9", "--issuer", "http://127.0.0.1:9", "--audience", "kaia-mcp", "--drift-interval", "-1"])
     assert rc == 3
-    assert "drift interval must be >= 0" in capsys.readouterr().err
+    assert "drift interval must be a finite number in [0, " in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "1e300"])
+def test_proxy_cli_non_finite_drift_interval_refuses_to_start(capsys: pytest.CaptureFixture[str], value: str) -> None:
+    rc = main(["proxy", "--upstream", "http://127.0.0.1:9", "--issuer", "http://127.0.0.1:9", "--audience", "kaia-mcp", f"--drift-interval={value}"])
+    assert rc == 3
+    assert "drift interval must be a finite number in [0, " in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flag", ["--introspection-cache-ttl", "--escalation-pending-ttl", "--escalation-approval-ttl", "--jwks-ttl"])
+@pytest.mark.parametrize("value", ["nan", "inf"])
+def test_proxy_cli_non_finite_durations_refuse_to_start(capsys: pytest.CaptureFixture[str], tmp_path: Any, flag: str, value: str) -> None:
+    rc = main(["proxy", "--upstream", "http://127.0.0.1:9", "--issuer", "http://127.0.0.1:9", "--audience", "kaia-mcp", "--escalation-dir", str(tmp_path / "q"), f"{flag}={value}"])
+    assert rc == 3
+    assert "finite" in capsys.readouterr().err

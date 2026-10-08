@@ -672,6 +672,55 @@ def test_build_config_rejects_negative_drift_interval() -> None:
     assert cfg is not None and cfg.drift is None
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), -1.0, threading.TIMEOUT_MAX * 2])
+def test_build_config_rejects_non_finite_or_out_of_range_drift_interval(bad: float) -> None:
+    """nan/inf used to slip through (nan < 0 is False) and silently stop the periodic recheck."""
+    signer = TestSigner.generate()
+    issuer = "http://idp.test:1"
+
+    def fetch(url: str, **_: Any) -> tuple[int, Any]:
+        if url.endswith("/openid-configuration"):
+            return 200, {"issuer": issuer, "jwks_uri": issuer + "/jwks"}
+        if url.endswith("/tool-scopes"):
+            return 200, {"tool_scopes": dict(KAIA_TOOL_SCOPES)}
+        return 200, signer.jwks()
+
+    kw: dict[str, Any] = {"upstream": issuer, "issuer": issuer, "audience": "kaia-mcp", "policy": kaia_policy(), "fetch": fetch}
+    cfg, rep = build_config(**kw, drift_interval=bad)
+    assert cfg is None and any("drift interval must be a finite number in [0, " in e for e in rep.errors), rep.errors
+    cfg, rep = build_config(**kw, drift_interval=threading.TIMEOUT_MAX)
+    assert cfg is not None and cfg.drift is not None and cfg.drift.interval == threading.TIMEOUT_MAX
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), 0.0, -1.0, threading.TIMEOUT_MAX * 2])
+def test_drift_monitor_rejects_bad_intervals(bad: float) -> None:
+    with pytest.raises(ValueError):
+        DriftMonitor("http://x/tool-scopes", KAIA_TOOL_SCOPES, interval=bad, fetch=lambda url, **_: (200, {}))
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+def test_build_config_rejects_bad_jwks_ttl(bad: float) -> None:
+    signer = TestSigner.generate()
+    issuer = "http://idp.test:1"
+
+    def fetch(url: str, **_: Any) -> tuple[int, Any]:
+        if url.endswith("/openid-configuration"):
+            return 200, {"issuer": issuer, "jwks_uri": issuer + "/jwks"}
+        if url.endswith("/tool-scopes"):
+            return 200, {"tool_scopes": dict(KAIA_TOOL_SCOPES)}
+        return 200, signer.jwks()
+
+    cfg, rep = build_config(upstream=issuer, issuer=issuer, audience="kaia-mcp", policy=kaia_policy(), fetch=fetch, jwks_ttl_seconds=bad)
+    assert cfg is None and any("jwks TTL" in e for e in rep.errors), rep.errors
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1.0])
+def test_introspection_cache_ttl_must_be_finite(bad: float) -> None:
+    """inf would cache an active answer until token exp: a revocation would never apply at the proxy."""
+    with pytest.raises(ValueError):
+        Introspector("http://idp/introspect", "c", "s", cache_ttl=bad)
+
+
 def test_build_config_drift_interval_zero_means_startup_check_only(rig_factory: Any) -> None:
     rig = rig_factory(drift_interval=0)
     assert rig.config.drift is None

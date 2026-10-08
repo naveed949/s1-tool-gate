@@ -27,8 +27,9 @@ At startup the proxy compares its own kaia tool -> scope map with the one the
 upstream publishes at ``/.well-known/kaia-mcp/tool-scopes`` and refuses to
 start on any difference or if the map cannot be fetched (unless the drift
 check is explicitly turned off). While running, ``DriftMonitor`` rechecks the
-map as soon as it starts and then every ``drift_interval`` seconds (a negative
-interval is a startup error; 0 = startup check only); on drift or a failed fetch every
+map as soon as it starts and then every ``drift_interval`` seconds (anything but a
+finite number in ``[0, threading.TIMEOUT_MAX]`` is a startup error; 0 = startup
+check only); on drift or a failed fetch every
 ``tools/call`` is denied (``claims_tool_scope_drift``) until the maps match
 again. State transitions are logged and audited.
 """
@@ -40,6 +41,7 @@ import hashlib
 import http.client
 import json
 import logging
+import math
 import sqlite3
 import threading
 import time
@@ -238,8 +240,8 @@ class Introspector:
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if self.cache_ttl < 0:
-            raise ValueError("introspection cache TTL must be >= 0")
+        if not (math.isfinite(self.cache_ttl) and self.cache_ttl >= 0):
+            raise ValueError(f"introspection cache TTL must be a finite number >= 0 (got {self.cache_ttl})")
 
     def _cached_active(self, key: str, now: float) -> bool:
         with self._lock:
@@ -330,8 +332,8 @@ class DriftMonitor:
         audit: Callable[[dict[str, Any]], None] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        if interval <= 0:
-            raise ValueError("drift interval must be positive")
+        if not (math.isfinite(interval) and 0 < interval <= threading.TIMEOUT_MAX):
+            raise ValueError(f"drift interval must be a finite number in (0, {threading.TIMEOUT_MAX}] (got {interval})")
         self.url = url
         self.expected = dict(expected)
         self.interval = float(interval)
@@ -748,8 +750,14 @@ def build_config(
     or an explicit URL. When introspection is on, missing credentials are an error.
     """
     errors: list[str] = []
-    if drift_interval < 0:
-        errors.append(f"drift interval must be >= 0 (got {drift_interval}); 0 = startup check only")
+    # nan compares False with everything and inf overflows Event.wait(): both used to
+    # slip past a plain "< 0" check and silently stop the periodic recheck.
+    if not (math.isfinite(drift_interval) and 0 <= drift_interval <= threading.TIMEOUT_MAX):
+        errors.append(f"drift interval must be a finite number in [0, {threading.TIMEOUT_MAX}] (got {drift_interval}); 0 = startup check only")
+    if not (math.isfinite(jwks_ttl_seconds) and jwks_ttl_seconds > 0):
+        errors.append(f"jwks TTL must be a finite number > 0 (got {jwks_ttl_seconds})")
+    if not (math.isfinite(introspection_cache_ttl) and introspection_cache_ttl >= 0):
+        errors.append(f"introspection cache TTL must be a finite number >= 0 (got {introspection_cache_ttl})")
     resolved_jwks = jwks_uri
     introspection_url: str | None = None
     try:
@@ -789,7 +797,7 @@ def build_config(
         drift = check_tool_scope_drift(scopes_url, policy.tool_scopes, fetch=fetch)
         if not drift["ok"]:
             errors.append("tool-scope drift check failed")
-        elif drift_interval > 0:
+        elif drift_interval > 0 and not errors:
             monitor = DriftMonitor(scopes_url, policy.tool_scopes, interval=drift_interval, fetch=fetch, audit=audit)
             monitor.record(drift)
 
