@@ -17,6 +17,7 @@ This directory is the maintained source for verifying the user-facing behavior o
 - Commands are literal. Keep tool names, scope strings, and reason codes unchanged.
 - Pass tokens through `S1_AUTHORIZATION`, never on argv.
 - Every feature starts from the baseline. No feature mutates shared state, and every token is minted fresh.
+- `live-proxy` is the only feature that starts processes and uses the network. It starts and stops its own kaia-mcp and proxies inside one drive. Its tokens come from kaia-mcp's demo IdP, not the TEST-ONLY kit.
 
 ## Proof and skip reporting
 
@@ -40,3 +41,4 @@ Each feature file starts with an H1 and one paragraph. Then come exactly four H2
 - [Token validation](./token-validation.md): missing, malformed, expired, wrong-audience, wrong-issuer, forged, and missing-claim tokens fail closed.
 - [Wallet escalation](./wallet-escalation.md): `generate_wallet` escalates (or denies) and is never allowed.
 - [kaia enforcement demo](./kaia-enforcement-demo.md): the 22 golden cases run through the gate and the enforcement seam, and the stub runs only on allow.
+- [Live proxy](./live-proxy.md): `python -m claims_gate proxy` in front of a real, running kaia-mcp. Allowed reads return chain data. Denies and wallet escalations never reach kaia-mcp. Forged, wrong-audience, expired, and revoked tokens are refused, and the proxy will not start on tool-scope drift.

@@ -7,11 +7,19 @@
                                      [--exp-in SECONDS] [--untrusted]
   S1_AUTHORIZATION="Bearer <jwt>" python -m claims_gate decide --jwks FILE --issuer ISS \
       --audience AUD --tool TOOL [--wallet-default escalate|deny]
+  [S1_INTROSPECTION_CLIENT_ID=... S1_INTROSPECTION_CLIENT_SECRET=...] \
+  python -m claims_gate proxy --upstream URL --issuer ISS --audience AUD [--port N]
+      [--introspection auto|URL] [--jwks-uri URL] [--tool-scopes-url URL | --no-drift-check]
+      [--audit-log FILE] [--wallet-default escalate|deny]
 
 ``decide`` reads the Authorization value from the ``S1_AUTHORIZATION`` env var
 (or ``--authorization-file``) so tokens stay out of argv. It prints the
 decision JSON and exits 0 for any decision; exit 2 is a usage/config error.
 ``demo`` exits 0 only when every golden case matched.
+``proxy`` prints its startup report as JSON, then ``ready: ...``, and serves
+until interrupted. It exits 3 without listening if discovery, the JWKS, the
+introspection setup, or the tool-scope drift check fails (fail closed).
+Introspection credentials come from the environment, never argv.
 """
 
 from __future__ import annotations
@@ -83,6 +91,54 @@ def _cmd_decide(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_proxy(args: argparse.Namespace) -> int:
+    import logging
+    import threading
+
+    from claims_gate.kaia import kaia_policy
+    from claims_gate.proxy import build_config, make_server
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    audit = None
+    if args.audit_log:
+        lock = threading.Lock()
+        audit_path = Path(args.audit_log)
+
+        def audit(record: dict[str, object]) -> None:
+            with lock, audit_path.open("a") as fh:
+                fh.write(json.dumps(record, sort_keys=True) + "\n")
+
+    config, report = build_config(
+        upstream=args.upstream,
+        issuer=args.issuer,
+        audience=args.audience,
+        policy=kaia_policy(args.wallet_default),
+        jwks_uri=args.jwks_uri,
+        introspection=args.introspection,
+        introspection_client_id=os.environ.get("S1_INTROSPECTION_CLIENT_ID") or None,
+        introspection_client_secret=os.environ.get("S1_INTROSPECTION_CLIENT_SECRET") or None,
+        tool_scopes_url=args.tool_scopes_url,
+        drift_check=not args.no_drift_check,
+        jwks_ttl_seconds=args.jwks_ttl,
+        mcp_path=args.mcp_path,
+        audit=audit,
+    )
+    print(json.dumps({"startup": report.to_dict()}), flush=True)
+    if config is None:
+        print("claims_gate proxy: refusing to start (fail closed): " + "; ".join(report.errors), file=sys.stderr, flush=True)
+        return 3
+    server = make_server(config, args.host, args.port)
+    host, port = server.server_address[:2]
+    print(f"ready: s1-tool-gate proxy on http://{host}:{port}{args.mcp_path} -> {args.upstream}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m claims_gate")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -112,6 +168,22 @@ def main(argv: list[str] | None = None) -> int:
     p_dec.add_argument("--authorization-file")
     p_dec.add_argument("--wallet-default", choices=["escalate", "deny"], default="escalate")
     p_dec.set_defaults(func=_cmd_decide)
+
+    p_proxy = sub.add_parser("proxy", help="live reverse proxy that gates an MCP Streamable HTTP server")
+    p_proxy.add_argument("--upstream", required=True, help="MCP server origin, e.g. http://127.0.0.1:3100")
+    p_proxy.add_argument("--issuer", required=True, help="pinned token issuer (exact match)")
+    p_proxy.add_argument("--audience", required=True, help="pinned token audience")
+    p_proxy.add_argument("--jwks-uri", help="override discovery's jwks_uri (also allows a different origin)")
+    p_proxy.add_argument("--jwks-ttl", type=float, default=300.0)
+    p_proxy.add_argument("--introspection", help="'auto' (discovery) or an RFC 7662 URL; credentials from S1_INTROSPECTION_CLIENT_ID/SECRET")
+    p_proxy.add_argument("--tool-scopes-url", help="default: <upstream>/.well-known/kaia-mcp/tool-scopes")
+    p_proxy.add_argument("--no-drift-check", action="store_true", help="skip the startup tool-scope drift check (not recommended)")
+    p_proxy.add_argument("--host", default="127.0.0.1")
+    p_proxy.add_argument("--port", type=int, default=0)
+    p_proxy.add_argument("--mcp-path", default="/")
+    p_proxy.add_argument("--audit-log", help="append one JSON line per decision (no tokens)")
+    p_proxy.add_argument("--wallet-default", choices=["escalate", "deny"], default="escalate")
+    p_proxy.set_defaults(func=_cmd_proxy)
 
     args = parser.parse_args(argv)
     return int(args.func(args))

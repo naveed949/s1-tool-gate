@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Drive one mapped feature of the claims gate CLI the way a partner integration would.
-# Usage: helpers/drive.sh <scope-mapping|token-validation|wallet-escalation|kaia-enforcement-demo>
+# Usage: helpers/drive.sh <scope-mapping|token-validation|wallet-escalation|kaia-enforcement-demo|live-proxy>
 # Writes decision JSON under ${EVIDENCE_DIR}/<feature>/ (never the tokens) and asserts literal outcomes.
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 FEATURE="${1:-}"
-FEATURES="scope-mapping|token-validation|wallet-escalation|kaia-enforcement-demo"
+FEATURES="scope-mapping|token-validation|wallet-escalation|kaia-enforcement-demo|live-proxy"
 [[ -n "${FEATURE}" ]] || { echo "Usage: helpers/drive.sh <${FEATURES}>" >&2; exit 2; }
 [[ -f "${INSTANCE_FILE}" ]] || { echo "drive: missing ${INSTANCE_FILE}; run launch.sh" >&2; exit 1; }
 
@@ -116,6 +116,40 @@ if problems:
     print("  FAIL demo: " + "; ".join(problems)); sys.exit(1)
 print(f"  ok   demo: {s['passed']}/{s['total']} golden cases, allow/deny/escalate={s['allow']}/{s['deny']}/{s['escalate']}, stub ran only for {sorted(s['stubCalls'])}, wallet stub calls=0")
 print("  ok   demo --wallet-default deny: wallet-escalate -> deny claims_wallet_denied, not escalated")
+PY
+    then :; else FAILS=$((FAILS + 1)); fi
+    ;;
+  live-proxy)
+    # Real kaia-mcp (local checkout via S1_VERIFY_KAIA_DIR / KAIA_MCP_DIR, else the pinned clone)
+    # behind `python -m claims_gate proxy`. The e2e writes its logs + summary.json into ${OUT}
+    # and scans them for every token and the introspection secret it handled.
+    KAIA_DIR_ARG=()
+    if [[ -n "${S1_VERIFY_KAIA_DIR:-${KAIA_MCP_DIR:-}}" ]]; then
+      KAIA_DIR_ARG=(--kaia-dir "${S1_VERIFY_KAIA_DIR:-${KAIA_MCP_DIR}}")
+    fi
+    rc=0
+    "${PY}" packages/claims-gate/e2e/live_kaia.py --evidence-dir "${OUT}" "${KAIA_DIR_ARG[@]+"${KAIA_DIR_ARG[@]}"}" > "${OUT}/live-e2e.stdout" 2>&1 || rc=$?
+    echo "${rc}" > "${OUT}/live-e2e.exit"
+    if "${PY}" - "${OUT}" "${rc}" <<'PY'
+import json, sys
+out, rc = sys.argv[1], int(sys.argv[2])
+try:
+    s = json.load(open(f"{out}/summary.json"))
+except OSError:
+    print(f"  FAIL live-proxy: no summary.json (exit {rc}); see {out}/live-e2e.stdout"); sys.exit(1)
+want = ["initialize-through-proxy", "allow-read", "encode-denied", "wallet-escalated", "forged-denied",
+        "wrong-aud-denied", "introspection-down", "revoked-denied", "drift-refused-missing",
+        "drift-refused-changed", "expired-denied", "audit-denies-never-forwarded", "no-token-in-logs"]
+got = {c["check"]: c for c in s["checks"]}
+problems = [f"missing check {w}" for w in want if w not in got]
+problems += [f"{c['check']} failed" for c in s["checks"] if not c["ok"]]
+if rc != 0: problems.append(f"exit {rc}")
+for c in s["checks"]:
+    print(f"  {'ok  ' if c['ok'] else 'FAIL'} {c['check']}")
+if problems:
+    print("  FAIL live-proxy: " + "; ".join(problems)); sys.exit(1)
+k = s["meta"]["kaia"]
+print(f"  ok   live-proxy: {s['summary']['passed']}/{s['summary']['total']} checks against kaia-mcp {k['rev']} ({'local ' + k['dir'] if k['ref'] is None else 'clone'})")
 PY
     then :; else FAILS=$((FAILS + 1)); fi
     ;;

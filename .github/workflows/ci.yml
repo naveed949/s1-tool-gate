@@ -24,3 +24,25 @@ jobs:
       - run: python -m pip install -e "packages/gate-client[dev]" -e "packages/gate-enforcement[dev]" -e "packages/e2e-demo[dev]" -e "packages/claims-gate[dev]"
       - run: python -m pytest packages/e2e-demo
       - run: python -m pytest packages/claims-gate
+
+  claims-gate-live-proxy:
+    # Live e2e: kaia-mcp (pinned commit in packages/claims-gate/e2e/live_kaia.py)
+    # behind the claims-gate proxy. Needs GitHub + Kaia public RPC egress.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e packages/gate-client -e packages/gate-enforcement -e "packages/claims-gate[dev]"
+      - run: python packages/claims-gate/e2e/live_kaia.py --evidence-dir live-e2e-evidence
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claims-gate-live-e2e
+          path: live-e2e-evidence/
+          if-no-files-found: ignore
