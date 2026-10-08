@@ -775,3 +775,71 @@ def test_proxy_introspection_cache_end_to_end(rig_factory: Any) -> None:
     assert (status, _err(data)["data"]["reasonCode"]) == (401, "claims_token_revoked")
     status, _, data = rig.post(CALL("get_block_number", 4), tok)
     assert (status, _err(data)["data"]["reasonCode"]) == (401, "claims_token_revoked")  # inactive not cached as allow
+
+
+# ---- listen backlog ------------------------------------------------------------
+
+BURST = 20
+
+
+def test_proxy_listen_backlog_holds_a_20_connection_burst(rig_factory: Any) -> None:
+    """All 20 connections are accepted by the kernel even while the accept loop is busy."""
+    import socket
+
+    rig = rig_factory()
+    server = make_server(rig.config)  # listening, but not accepting yet
+    port = server.server_address[1]
+    socks: list[socket.socket] = []
+    errors: list[str] = []
+    thread: threading.Thread | None = None
+    try:
+        for _ in range(BURST):
+            c = socket.socket()
+            c.settimeout(0.5)
+            try:
+                c.connect(("127.0.0.1", port))
+                c.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                socks.append(c)
+            except OSError as err:
+                errors.append(type(err).__name__)
+                c.close()
+        assert errors == [] and len(socks) == BURST, errors
+        thread = _serve(server)
+        for c in socks:
+            c.settimeout(10)
+            data = b""
+            while chunk := c.recv(65536):
+                data += chunk
+            assert data.startswith((b"HTTP/1.0 200", b"HTTP/1.1 200")), data[:80]
+    finally:
+        for c in socks:
+            c.close()
+        if thread is not None:  # shutdown() blocks forever unless serve_forever is running
+            server.shutdown()
+            thread.join(timeout=5)
+        server.server_close()
+
+
+def test_proxy_serves_20_concurrent_requests_without_resets(rig_factory: Any) -> None:
+    rig = rig_factory()
+    tok = rig.token("kaia:read")
+    barrier = threading.Barrier(BURST)
+    results: list[Any] = []
+    lock = threading.Lock()
+
+    def one(i: int) -> None:
+        barrier.wait(timeout=10)
+        try:
+            out: Any = rig.post(CALL("get_block_number", i), tok)[0]
+        except OSError as err:  # ConnectionResetError, BrokenPipeError, timeouts
+            out = type(err).__name__
+        with lock:
+            results.append(out)
+
+    threads = [threading.Thread(target=one, args=(i,)) for i in range(BURST)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert results == [200] * BURST, results
+    assert len(rig.fake.mcp_requests) == BURST

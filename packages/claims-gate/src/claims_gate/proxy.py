@@ -687,11 +687,19 @@ class _Handler(BaseHTTPRequestHandler):
             conn.close()
 
 
+# listen(2) backlog. socketserver's default (5) let the kernel drop connections
+# under a modest burst (~20 concurrent clients); the kernel caps this at somaxconn.
+LISTEN_BACKLOG = 128
+
+
+class _ProxyHTTPServer(ThreadingHTTPServer):
+    request_queue_size = LISTEN_BACKLOG
+    daemon_threads = True
+
+
 def make_server(config: ProxyConfig, host: str = "127.0.0.1", port: int = 0) -> ThreadingHTTPServer:
     handler = type("ClaimsGateProxyHandler", (_Handler,), {"config": config})
-    server = ThreadingHTTPServer((host, port), handler)
-    server.daemon_threads = True
-    return server
+    return _ProxyHTTPServer((host, port), handler)
 
 
 @dataclass
