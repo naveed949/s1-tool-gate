@@ -1,8 +1,10 @@
 """kaia-mcp fixture: real tool names and scopes.
 
-Source of truth: naveed949/kaia-mcp@db76732 ``src/auth/scopes.ts`` (TOOL_SCOPES)
-and ``src/auth/constants.ts`` (SCOPES). Keep this list in sync by hand; the
-claims gate denies any tool not listed here (``claims_unknown_tool``).
+Source of truth: naveed949/kaia-mcp@253d6c8 ``src/auth/scopes.ts`` (TOOL_SCOPES)
+and ``src/auth/constants.ts`` (SCOPES); the map is unchanged since db76732. Keep
+this list in sync by hand; the claims gate denies any tool not listed here
+(``claims_unknown_tool``). ``claims_gate.proxy`` refuses to start if a live
+kaia-mcp publishes a different map.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ KAIA_READ = "kaia:read"
 KAIA_ENCODE = "kaia:encode"
 KAIA_WALLET = "kaia:wallet"
 
-KAIA_SOURCE = "naveed949/kaia-mcp@db76732:src/auth/scopes.ts"
+KAIA_SOURCE = "naveed949/kaia-mcp@253d6c8:src/auth/scopes.ts"
 
 KAIA_READ_TOOLS: tuple[str, ...] = (
     "get_kaia_balance",

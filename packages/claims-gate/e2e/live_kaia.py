@@ -53,8 +53,8 @@ from claims_gate.verify import VerifiedClaims, VerifierConfig, verify_access_tok
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 # kaia-mcp commit that first ships JWT access tokens, JWKS, introspection, and the
-# tool-scopes metadata (naveed949/kaia-mcp#3 head). Bump to the merge commit once merged.
-DEFAULT_KAIA_REF = "856f6cdabb4a394e3d6f4522c5bfb1a8b24991aa"
+# tool-scopes metadata (naveed949/kaia-mcp#3, squash-merge commit on main).
+DEFAULT_KAIA_REF = "253d6c88c989019759449b5fbde44ae98ab49096"
 DEFAULT_KAIA_REPO = "https://github.com/naveed949/kaia-mcp.git"
 INTROSPECTION_CLIENT_ID = "s1-tool-gate"
 JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")

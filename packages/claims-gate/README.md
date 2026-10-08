@@ -36,7 +36,7 @@ The live proxy (below) adds four deny codes of its own:
 
 ## kaia-mcp fixture
 
-`claims_gate.kaia` copies kaia-mcp's real tool → scope map from `naveed949/kaia-mcp@db76732:src/auth/scopes.ts`:
+`claims_gate.kaia` copies kaia-mcp's real tool → scope map from `naveed949/kaia-mcp@253d6c8:src/auth/scopes.ts`:
 
 - `kaia:read` covers 24 read tools (`get_kaia_balance`, `get_block`, `read_contract`, `estimate_gas`, ...).
 - `kaia:encode` covers `encode_function_data`.

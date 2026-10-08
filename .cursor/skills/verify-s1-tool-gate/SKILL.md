@@ -38,7 +38,7 @@ Doctor is read-only. It requires all of these:
 - `jwks.json` exists.
 - `claims_gate` imports from this checkout's `packages/claims-gate/src`, not a stale install elsewhere.
 - `gate_enforcement` imports.
-- The kaia fixture reports source `...db76732:src/auth/scopes.ts`, 26 tools, and wallet tools `["generate_wallet"]`.
+- The kaia fixture reports source `...253d6c8:src/auth/scopes.ts`, 26 tools, and wallet tools `["generate_wallet"]`.
 - `python -m claims_gate proxy --help` works.
 
 Doctor also prints the `live-proxy` prerequisites (`node`, `npm`, `git`, and the kaia-mcp source). It does not fail on them, because the other features do not need them.

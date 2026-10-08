@@ -5,7 +5,7 @@ This directory is the maintained source for verifying the user-facing behavior o
 ## Baseline preconditions
 
 - Launch with `.cursor/skills/verify-s1-tool-gate/helpers/launch.sh` so the run has its own TEST-ONLY key and `jwks.json` under `/tmp/s1-verify-<run-id>/kit`.
-- `doctor.sh` must exit 0. It checks that `claims_gate` is imported from this checkout, and that the fixture is kaia-mcp `db76732` with 26 tools and wallet tool `generate_wallet`.
+- `doctor.sh` must exit 0. It checks that `claims_gate` is imported from this checkout, and that the fixture is kaia-mcp `253d6c8` with 26 tools and wallet tool `generate_wallet`.
 - Trust anchors for every `decide` call:
   - issuer `https://idp.test.invalid`
   - audience `kaia-mcp`
