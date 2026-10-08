@@ -146,18 +146,22 @@ Approval only turns an *escalate* into one allow. The claims policy runs first, 
 
 ### Live e2e
 
-[`e2e/live_kaia.py`](e2e/live_kaia.py) starts kaia-mcp, either cloned at a pinned commit (`--kaia-ref`, default in the script) or a local checkout (`--kaia-dir` / `KAIA_MCP_DIR`). It starts the proxy, logs in with the **device flow**, and proves each of these:
+[`e2e/live_kaia.py`](e2e/live_kaia.py) starts kaia-mcp, either cloned at a pinned commit (`--kaia-ref`, default in the script) or from a local checkout (`--kaia-dir` / `KAIA_MCP_DIR`). It then starts the proxy (with an escalation queue and a 3s introspection cache) and logs in with the **device flow**. It proves each of these:
 
-- a `get_block_number` read returns live mainnet data through the proxy
-- `encode_function_data` is denied by scope at the proxy, with zero `Tool call` lines for it in kaia-mcp's log
-- `generate_wallet` is escalated and never forwarded
-- forged, wrong-audience and expired tokens are denied
-- a revoked token is denied via introspection, while it still verifies offline
-- unreachable introspection fails closed
-- the proxy refuses to start on a missing or changed tool-scope map
-- no token appears in any log
+- `encode_function_data` with `kaia:encode` returns `balanceOf` calldata through the proxy. This is the **required allow-path check**, and it is fully offline.
+- `encode_function_data` without `kaia:encode` is denied by scope at the proxy, and kaia-mcp's log has zero `Tool call` lines for it.
+- `generate_wallet` is escalated, queued as `pending`, and never forwarded.
+  - After `escalations approve <id>`, exactly one identical retry reaches kaia-mcp. kaia-mcp itself still refuses it (`tool_disabled`). The next retry is escalated again with a new id.
+  - After `escalations deny <id>`, the identical retry gets `claims_escalation_denied`.
+- Forged, wrong-audience, and expired tokens are denied.
+- A token revoked at kaia-mcp still verifies offline. The proxy forwards it only while its introspection cache entry lives, and kaia-mcp refuses it on its own. After that the proxy denies it with `claims_token_revoked`.
+- Unreachable introspection fails closed.
+- The proxy refuses to start on a missing or changed tool-scope map.
+- While running with `--drift-interval 1`, a map change makes the proxy deny `tools/call` with `claims_tool_scope_drift`, and restoring the map lets calls through again.
+- No token appears in any log.
+- **Optional:** a `get_block_number` read returns live mainnet data. It needs the public Kaia RPC (`KAIA_RPC_URL`, default `https://public-en.node.kaia.io`). The harness probes the RPC first, and again if the call fails. If the RPC is unreachable, the check is reported as `SKIP` and the run does not fail.
 
-It writes `summary.json` plus all logs to `--evidence-dir` and exits 0 only if every check passed. CI runs it in the `claims-gate-live-proxy` job. It needs network access to GitHub and the Kaia public RPC.
+It writes `summary.json` (`passed`/`failed`/`skipped`/`total`, and a `result` of `PASS`/`FAIL`/`SKIP` per check) plus all logs to `--evidence-dir`. It exits 0 only if no check failed. Only `allow-read` may SKIP; a required check can never SKIP. CI runs it in the `claims-gate-live-proxy` job. It needs GitHub access for the clone. The Kaia RPC is needed only for the optional read.
 
 ```bash
 python packages/claims-gate/e2e/live_kaia.py --evidence-dir /tmp/s1-live [--kaia-dir ../kaia-mcp]

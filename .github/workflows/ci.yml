@@ -27,7 +27,8 @@ jobs:
 
   claims-gate-live-proxy:
     # Live e2e: kaia-mcp (pinned commit in packages/claims-gate/e2e/live_kaia.py)
-    # behind the claims-gate proxy. Needs GitHub + Kaia public RPC egress.
+    # behind the claims-gate proxy. Needs GitHub egress; the Kaia public RPC is
+    # only used by the optional allow-read check (SKIP, not FAIL, if unreachable).
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

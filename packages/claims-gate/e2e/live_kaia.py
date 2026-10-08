@@ -4,25 +4,39 @@
 Starts kaia-mcp (pinned commit, or a local checkout), starts the proxy, logs in
 with the device flow against kaia-mcp's demo IdP, and proves:
 
-  allow-read            get_block_number through the proxy returns live chain data
-  encode-denied         encode_function_data denied at the proxy (claims_insufficient_scope),
-                        and kaia-mcp's log has no Tool call line for it
-  wallet-escalated      generate_wallet escalated (-32051), never forwarded
-  forged-denied         same claims + real kid, foreign key -> claims_invalid_token
-  wrong-aud-denied      proxy pinned to audience other-api -> claims_audience_mismatch
-  revoked-denied        token revoked at kaia-mcp, still valid offline, denied via
-                        introspection -> claims_token_revoked
-  introspection-down    introspection configured but unreachable -> claims_introspection_unavailable
-  expired-denied        after the access-token TTL -> claims_expired
-  drift-refused         proxy refuses to start when the tool-scope map differs or is missing
-  no-token-in-logs      no token appears in kaia, proxy, or audit logs
+  initialize-through-proxy   MCP initialize through the proxy; Mcp-Session-Id passed through
+  encode-denied              encode_function_data without kaia:encode denied at the proxy
+                             (claims_insufficient_scope); kaia-mcp logs no Tool call for it
+  wallet-escalated           generate_wallet escalated (-32051) with a queued escalationId, never forwarded
+  escalation-approved-once   after `escalations approve <id>` exactly one identical retry reaches
+                             kaia-mcp (which itself refuses: tool_disabled); the next retry is
+                             escalated again with a new id
+  escalation-denied          after `escalations deny <id>` the identical retry is -32050
+                             claims_escalation_denied, never forwarded
+  forged-denied              same claims + real kid, foreign key -> claims_invalid_token
+  wrong-aud-denied           proxy pinned to audience other-api -> claims_audience_mismatch
+  introspection-down         introspection configured but unreachable -> claims_introspection_unavailable
+  allow-encode               REQUIRED allow path, offline: encode_function_data with kaia:encode
+                             returns balanceOf calldata (0x70a08231...) from kaia-mcp
+  revoked-denied             token revoked at kaia-mcp, still valid offline: the proxy forwards it only
+                             while its introspection cache entry lives (3s; kaia-mcp itself then
+                             refuses it), after that the proxy denies claims_token_revoked
+  drift-refused-missing/changed  proxy refuses to start when the tool-scope map is missing or differs
+  drift-runtime-fail-closed  proxy running with --drift-interval 1: the map changes -> tools/call
+                             denied (claims_tool_scope_drift, not forwarded); map restored -> allowed
+  allow-read                 OPTIONAL: get_block_number returns live mainnet data. Needs the public
+                             Kaia RPC; reported as SKIP (not a failure) when the RPC is unreachable
+  expired-denied             after the access-token TTL -> claims_expired
+  audit-denies-never-forwarded   no deny/escalate audit line was forwarded
+  no-token-in-logs           no token or secret appears in kaia, proxy, or audit logs
 
 Usage (repo root, with claims-gate installed):
 
   python packages/claims-gate/e2e/live_kaia.py --evidence-dir DIR [--kaia-dir PATH | --kaia-ref SHA]
 
-Needs git, node>=20, npm, and outbound HTTPS (GitHub for the clone, Kaia public RPC
-for the read). Exit 0 only when every check passed. Nothing here is a real secret:
+Needs git, node>=20, npm, and GitHub egress for the clone. The Kaia public RPC is
+only needed for the optional allow-read check. Exit 0 iff no check FAILed
+(SKIP is allowed only for optional checks). Nothing here is a real secret:
 the introspection secret is random per run, and kaia-mcp's signing key lives only
 in that process's memory.
 """
@@ -57,6 +71,12 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 DEFAULT_KAIA_REF = "253d6c88c989019759449b5fbde44ae98ab49096"
 DEFAULT_KAIA_REPO = "https://github.com/naveed949/kaia-mcp.git"
 INTROSPECTION_CLIENT_ID = "s1-tool-gate"
+DEFAULT_KAIA_RPC = "https://public-en.node.kaia.io"
+# Checks allowed to SKIP (environment-dependent). Everything else must PASS.
+OPTIONAL_CHECKS = frozenset({"allow-read"})
+INTROSPECTION_CACHE_TTL = 3.0
+BALANCE_OF_ABI = json.dumps([{"type": "function", "name": "balanceOf", "inputs": [{"name": "account", "type": "address"}], "outputs": [{"type": "uint256"}], "stateMutability": "view"}])
+BALANCE_OF_ARGS = {"abi": BALANCE_OF_ABI, "functionName": "balanceOf", "args": ["0x1234567890123456789012345678901234567890"]}
 JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
 
 
@@ -149,6 +169,29 @@ class Mcp:
         return status, body
 
 
+def rpc_reachable(url: str, timeout: float = 8.0) -> tuple[bool, str]:
+    """POST eth_blockNumber to a JSON-RPC endpoint. (True, detail) only for a JSON-RPC ``result``."""
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(url, data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []}).encode(), headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            doc = json.loads(resp.read())
+    except (OSError, urllib.error.URLError, ValueError) as err:
+        return False, f"{url}: {type(err).__name__}: {err}"[:300]
+    if isinstance(doc, dict) and isinstance(doc.get("result"), str):
+        return True, f"{url}: eth_blockNumber={doc['result']}"
+    return False, f"{url}: no JSON-RPC result"
+
+
+def summarize(checks: list[dict[str, Any]]) -> dict[str, Any]:
+    passed = sum(c["result"] == "PASS" for c in checks)
+    failed = sum(c["result"] != "PASS" and c["result"] != "SKIP" for c in checks)
+    skipped = sum(c["result"] == "SKIP" for c in checks)
+    return {"passed": passed, "failed": failed, "skipped": skipped, "total": len(checks), "ok": failed == 0 and passed > 0}
+
+
 class Run:
     def __init__(self, evidence: Path) -> None:
         self.evidence = evidence
@@ -157,8 +200,18 @@ class Run:
         self.tokens: list[str] = []
 
     def check(self, name: str, ok: bool, **observed: Any) -> None:
-        self.checks.append({"check": name, "ok": bool(ok), **observed})
-        log(f"{'PASS' if ok else 'FAIL'} {name} {json.dumps(observed, sort_keys=True)}")
+        result = "PASS" if ok else "FAIL"
+        # "check"/"result"/"ok" are written last so an observed field can never overwrite them.
+        self.checks.append({**observed, "check": name, "result": result, "ok": bool(ok)})
+        log(f"{result} {name} {json.dumps(observed, sort_keys=True)}")
+
+    def skip(self, name: str, reason: str, **observed: Any) -> None:
+        """SKIP an optional check. A required check cannot be skipped: it FAILs."""
+        if name not in OPTIONAL_CHECKS:
+            self.check(name, False, skipRefused=f"required check cannot SKIP: {reason}", **observed)
+            return
+        self.checks.append({**observed, "check": name, "result": "SKIP", "ok": None, "skipReason": reason})
+        log(f"SKIP {name} (optional; not a failure): {reason}")
 
     def spawn(self, cmd: list[str], *, cwd: Path, env: dict[str, str], logfile: Path) -> subprocess.Popen[Any]:
         fh = logfile.open("w")
@@ -220,6 +273,23 @@ def device_login(kaia_url: str, scope: str) -> dict[str, Any]:
 
 def tool_calls(kaia_log: Path, tool: str) -> int:
     return len(re.findall(rf"msg=Tool call tool={re.escape(tool)} ", kaia_log.read_text()))
+
+
+def result_text(body: Any) -> str:
+    content = ((body or {}).get("result") or {}).get("content") or []
+    return "".join(c.get("text", "") for c in content if isinstance(c, dict))
+
+
+def wait_for(pred: Any, timeout: float) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if pred():
+                return True
+        except (OSError, ValueError, KeyError):
+            pass
+        time.sleep(0.2)
+    return False
 
 
 def reason(body: Any) -> str | None:
@@ -288,8 +358,18 @@ def main() -> int:
         log(f"kaia-mcp {kaia_rev} up at {kaia_url}")
 
         gw_env = {"S1_INTROSPECTION_CLIENT_ID": INTROSPECTION_CLIENT_ID, "S1_INTROSPECTION_CLIENT_SECRET": introspection_secret}
-        proxy_url, _, _ = start_proxy(r, "main", kaia_url, extra=["--introspection", "auto"], env_extra=gw_env)
+        esc_dir = work / "escalations"
+        proxy_url, _, _ = start_proxy(r, "main", kaia_url, extra=["--introspection", "auto", "--introspection-cache-ttl", str(INTROSPECTION_CACHE_TTL), "--escalation-dir", str(esc_dir)], env_extra=gw_env)
         log(f"proxy up at {proxy_url}")
+
+        def escalations(*cli: str) -> tuple[int, Any]:
+            out = subprocess.run([sys.executable, "-m", "claims_gate", "escalations", *cli, "--dir", str(esc_dir)], capture_output=True, text=True, check=False)
+            with (evidence / "escalations-cli.log").open("a") as fh:
+                fh.write(f"$ escalations {' '.join(cli)} -> exit {out.returncode}\n{out.stdout}{out.stderr}")
+            try:
+                return out.returncode, json.loads(out.stdout) if out.stdout.strip() else None
+            except ValueError:
+                return out.returncode, None
 
         # Device-flow login (kaia:read + kaia:wallet; deliberately no kaia:encode).
         t1 = device_login(kaia_url, "kaia:read kaia:wallet")
@@ -303,17 +383,40 @@ def main() -> int:
         st, body = mcp.initialize()
         r.check("initialize-through-proxy", st == 200 and bool(mcp.session), status=st, sessionIdForwarded=bool(mcp.session))
 
-        before = tool_calls(kaia_log, "get_block_number")
-        st, body = mcp.call("get_block_number", {"network": "mainnet"})
-        text = "".join(c.get("text", "") for c in (body or {}).get("result", {}).get("content", []) if isinstance(c, dict))
-        block = re.search(r"\d{6,}", text)
-        r.check("allow-read", st == 200 and "error" not in (body or {}) and block is not None and tool_calls(kaia_log, "get_block_number") == before + 1, status=st, resultText=text[:200], kaiaToolCallLines=tool_calls(kaia_log, "get_block_number"))
-
-        st, body = mcp.call("encode_function_data", {"abi": "[]", "functionName": "x", "args": []})
+        st, body = mcp.call("encode_function_data", BALANCE_OF_ARGS)
         r.check("encode-denied", st == 200 and body["error"]["code"] == -32050 and reason(body) == "claims_insufficient_scope" and tool_calls(kaia_log, "encode_function_data") == 0, status=st, error=body.get("error"), kaiaToolCallLines=tool_calls(kaia_log, "encode_function_data"))
 
         st, body = mcp.call("generate_wallet")
-        r.check("wallet-escalated", st == 200 and body["error"]["code"] == -32051 and reason(body) == "claims_wallet_escalate" and bool(body["error"]["data"].get("escalationId")) and tool_calls(kaia_log, "generate_wallet") == 0, status=st, error=body.get("error"), kaiaToolCallLines=tool_calls(kaia_log, "generate_wallet"))
+        err = (body or {}).get("error") or {}
+        id1 = (err.get("data") or {}).get("escalationId")
+        _, queued = escalations("list")
+        queued_row = next((e for e in queued or [] if e.get("id") == id1), None)
+        r.check("wallet-escalated", st == 200 and err.get("code") == -32051 and reason(body) == "claims_wallet_escalate" and bool(id1) and queued_row is not None and queued_row["status"] == "pending" and queued_row["sub"] == claims["sub"] and tool_calls(kaia_log, "generate_wallet") == 0, status=st, error=err, queued=queued_row, kaiaToolCallLines=tool_calls(kaia_log, "generate_wallet"))
+
+        rc_approve, approved = escalations("approve", str(id1))
+        st_retry, retry = mcp.call("generate_wallet")
+        lines_after_retry = tool_calls(kaia_log, "generate_wallet")
+        st_again, again = mcp.call("generate_wallet")
+        id2 = (((again or {}).get("error") or {}).get("data") or {}).get("escalationId")
+        _, rows = escalations("list")
+        by_id = {e["id"]: e for e in rows or []}
+        retry_err = (retry or {}).get("error") or {}
+        kaia_answered = retry_err.get("code") not in (-32050, -32051) and "tool_disabled" in json.dumps(retry)
+        r.check(
+            "escalation-approved-once",
+            rc_approve == 0 and (approved or {}).get("status") == "approved" and st_retry == 200 and kaia_answered and lines_after_retry == 1
+            and st_again == 200 and ((again or {}).get("error") or {}).get("code") == -32051 and bool(id2) and id2 != id1
+            and tool_calls(kaia_log, "generate_wallet") == 1 and by_id.get(id1, {}).get("status") == "consumed" and by_id.get(id2, {}).get("status") == "pending",
+            approveExit=rc_approve, retryStatus=st_retry, retryAnsweredByKaia=kaia_answered, retryBody=json.dumps(retry)[:300],
+            kaiaToolCallLines=tool_calls(kaia_log, "generate_wallet"), nextEscalationId=id2, statuses={k: v["status"] for k, v in by_id.items()},
+        )
+
+        rc_deny, denied = escalations("deny", str(id2))
+        st, body = mcp.call("generate_wallet")
+        err = (body or {}).get("error") or {}
+        r.check("escalation-denied", rc_deny == 0 and (denied or {}).get("status") == "denied" and st == 200 and err.get("code") == -32050 and reason(body) == "claims_escalation_denied" and (err.get("data") or {}).get("escalationId") == id2 and tool_calls(kaia_log, "generate_wallet") == 1, denyExit=rc_deny, status=st, error=err, kaiaToolCallLines=tool_calls(kaia_log, "generate_wallet"))
+        _, final_rows = escalations("list")
+        (evidence / "escalations.json").write_text(json.dumps(final_rows, indent=2) + "\n")
 
         foreign = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         forged = jwt.encode(claims, foreign, algorithm="RS256", headers={"kid": header["kid"], "typ": "at+jwt"})
@@ -325,20 +428,45 @@ def main() -> int:
         st, body = Mcp(wrong_aud_url, access).initialize()
         r.check("wrong-aud-denied", st == 401 and reason(body) == "claims_audience_mismatch", status=st, reasonCode=reason(body), proxyAudience="other-api", tokenAud=claims.get("aud"))
 
+        # Fresh kaia:encode token (independent of t1's short TTL).
+        t3 = device_login(kaia_url, "kaia:encode")
+        r.tokens += [t3["access_token"], t3["refresh_token"]]
+
         dead = f"http://127.0.0.1:{free_port()}/oauth/introspect"
         down_url, _, _ = start_proxy(r, "introspection-down", kaia_url, extra=["--introspection", dead], env_extra=gw_env)
-        st, body = Mcp(down_url, access).initialize()
+        st, body = Mcp(down_url, t3["access_token"]).initialize()
         r.check("introspection-down", st == 401 and reason(body) == "claims_introspection_unavailable", status=st, reasonCode=reason(body))
+
+        m3 = Mcp(proxy_url, t3["access_token"])
+        st_init, _ = m3.initialize()
+        before = tool_calls(kaia_log, "encode_function_data")
+        st, body = m3.call("encode_function_data", BALANCE_OF_ARGS)
+        text = result_text(body)
+        r.check("allow-encode", st_init == 200 and st == 200 and "error" not in (body or {}) and re.fullmatch(r"0x70a08231[0-9a-fA-F]{64}", text.strip()) is not None and tool_calls(kaia_log, "encode_function_data") == before + 1, status=st, resultText=text[:200], kaiaToolCallLines=tool_calls(kaia_log, "encode_function_data"))
 
         t2 = device_login(kaia_url, "kaia:read")
         r.tokens += [t2["access_token"], t2["refresh_token"]]
         m2 = Mcp(proxy_url, t2["access_token"])
         st_before, _ = m2.initialize()
+        cached_at = time.time()
         rv_status, _ = form(kaia_url + "/oauth/revoke", {"token": t2["access_token"]})
         _, _, jwks_raw = request("GET", kaia_url + "/oauth/jwks")
         offline = verify_access_token(t2["access_token"], VerifierConfig(jwks=json.loads(jwks_raw), issuer=kaia_url, audience="kaia-mcp"))
+        # Within the cache TTL the proxy still lets the revoked token through (documented
+        # revocation latency); kaia-mcp then refuses it itself (defense in depth).
+        st_cached, b_cached = Mcp(proxy_url, t2["access_token"]).initialize()
+        cached_window = time.time() - cached_at
+        proxy_reason_cached = reason(b_cached)
+        proxy_let_through = not (proxy_reason_cached or "").startswith("claims_")
+        time.sleep(max(0.0, cached_at + INTROSPECTION_CACHE_TTL + 0.5 - time.time()))
         st, body = Mcp(proxy_url, t2["access_token"]).initialize()
-        r.check("revoked-denied", st_before == 200 and rv_status == 200 and isinstance(offline, VerifiedClaims) and st == 401 and reason(body) == "claims_token_revoked", statusBeforeRevoke=st_before, revokeStatus=rv_status, stillValidOffline=isinstance(offline, VerifiedClaims), status=st, reasonCode=reason(body))
+        r.check(
+            "revoked-denied",
+            st_before == 200 and rv_status == 200 and isinstance(offline, VerifiedClaims) and cached_window < INTROSPECTION_CACHE_TTL and proxy_let_through and st == 401 and reason(body) == "claims_token_revoked",
+            statusBeforeRevoke=st_before, revokeStatus=rv_status, stillValidOffline=isinstance(offline, VerifiedClaims),
+            introspectionCacheTtl=INTROSPECTION_CACHE_TTL, withinCacheTtl={"proxyForwarded": proxy_let_through, "proxyReasonCode": proxy_reason_cached, "kaiaStatus": st_cached},
+            status=st, reasonCode=reason(body),
+        )
 
         for name, url_or_doc in (("drift-missing", kaia_url + "/.well-known/kaia-mcp/does-not-exist"), ("drift-changed", dict(KAIA_TOOL_SCOPES, encode_function_data="kaia:read"))):
             srv = None
@@ -356,16 +484,71 @@ def main() -> int:
             out = plog.read_text()
             r.check(name.replace("drift-", "drift-refused-"), rc == 3 and "ready:" not in out and "refusing to start" in out, exitCode=rc)
 
+        # Runtime drift: the proxy starts against a matching map that then changes under it.
+        live_map = {"tool_scopes": dict(KAIA_TOOL_SCOPES)}
+        srv, url = serve_json(live_map)
+        try:
+            rt_url, _, rt_log = start_proxy(r, "drift-runtime", kaia_url, extra=["--tool-scopes-url", url, "--drift-interval", "1"])
+            health = rt_url.rstrip("/") + "/health"
+            t4 = device_login(kaia_url, "kaia:encode")
+            r.tokens += [t4["access_token"], t4["refresh_token"]]
+            m4 = Mcp(rt_url, t4["access_token"])
+            m4.initialize()
+            n0 = tool_calls(kaia_log, "encode_function_data")
+            st_ok, b_ok = m4.call("encode_function_data", BALANCE_OF_ARGS)
+            live_map["tool_scopes"] = dict(KAIA_TOOL_SCOPES, encode_function_data="kaia:read")
+            flipped = wait_for(lambda: not json.loads(request("GET", health)[2])["toolScopes"]["ok"], 10)
+            st_drift, b_drift = m4.call("encode_function_data", BALANCE_OF_ARGS)
+            n1 = tool_calls(kaia_log, "encode_function_data")
+            live_map["tool_scopes"] = dict(KAIA_TOOL_SCOPES)
+            recovered = wait_for(lambda: json.loads(request("GET", health)[2])["toolScopes"]["ok"], 10)
+            st_back, b_back = m4.call("encode_function_data", BALANCE_OF_ARGS)
+            n2 = tool_calls(kaia_log, "encode_function_data")
+        finally:
+            srv.shutdown()
+        rt_text = rt_log.read_text()
+        r.check(
+            "drift-runtime-fail-closed",
+            st_ok == 200 and "error" not in (b_ok or {}) and flipped and st_drift == 200 and reason(b_drift) == "claims_tool_scope_drift" and n1 == n0 + 1
+            and recovered and st_back == 200 and "error" not in (b_back or {}) and n2 == n1 + 1 and "ok -> drift" in rt_text and "drift -> ok" in rt_text,
+            beforeStatus=st_ok, flippedToClosed=flipped, duringDriftReason=reason(b_drift), recovered=recovered, afterStatus=st_back,
+            kaiaToolCallLines=[n0, n1, n2], transitionsLogged=["ok -> drift" in rt_text, "drift -> ok" in rt_text],
+        )
+
+        # Optional live chain read: SKIP (not FAIL) when the public RPC is unreachable.
+        rpc_url = os.environ.get("KAIA_RPC_URL") or DEFAULT_KAIA_RPC
+        reachable, probe = rpc_reachable(rpc_url)
+        if not reachable:
+            r.skip("allow-read", f"Kaia RPC unreachable before the call: {probe}")
+        else:
+            t5 = device_login(kaia_url, "kaia:read")
+            r.tokens += [t5["access_token"], t5["refresh_token"]]
+            m5 = Mcp(proxy_url, t5["access_token"])
+            m5.initialize()
+            before_read = tool_calls(kaia_log, "get_block_number")
+            st, body = m5.call("get_block_number", {"network": "mainnet"})
+            text = result_text(body)
+            block = re.search(r"\d{6,}", text)
+            ok = st == 200 and "error" not in (body or {}) and block is not None and tool_calls(kaia_log, "get_block_number") == before_read + 1
+            observed = {"status": st, "resultText": text[:200], "kaiaToolCallLines": tool_calls(kaia_log, "get_block_number"), "rpcProbe": probe}
+            still, probe_after = (True, probe) if ok else rpc_reachable(rpc_url)
+            if not ok and not still:
+                r.skip("allow-read", f"Kaia RPC became unreachable during the call: {probe_after}", **observed)
+            else:
+                r.check("allow-read", ok, **observed)
+
         wait = claims["exp"] - time.time() + 1.5
         if wait > 0:
             log(f"waiting {wait:.1f}s for the first access token to expire")
             time.sleep(wait)
+        before_exp = tool_calls(kaia_log, "get_block_number")
         st, body = mcp.call("get_block_number", {"network": "mainnet"})
-        r.check("expired-denied", st == 401 and reason(body) == "claims_expired" and tool_calls(kaia_log, "get_block_number") == before + 1, status=st, reasonCode=reason(body))
+        r.check("expired-denied", st == 401 and reason(body) == "claims_expired" and tool_calls(kaia_log, "get_block_number") == before_exp, status=st, reasonCode=reason(body))
 
         audit = [json.loads(line) for line in (evidence / "audit-main.jsonl").read_text().splitlines() if line.strip()]
         denied_forwarded = [a for a in audit if a.get("event") in ("deny", "escalate") and a.get("forwarded")]
-        r.check("audit-denies-never-forwarded", len(audit) > 0 and not denied_forwarded, auditLines=len(audit), deniedButForwarded=len(denied_forwarded))
+        approved_forwarded = [a for a in audit if a.get("stage") == "escalation" and a.get("event") == "allow" and a.get("forwarded")]
+        r.check("audit-denies-never-forwarded", len(audit) > 0 and not denied_forwarded and len(approved_forwarded) == 1, auditLines=len(audit), deniedButForwarded=len(denied_forwarded), approvedEscalationsForwarded=len(approved_forwarded))
     except Exception as err:  # noqa: BLE001 - report any harness failure as a failed check
         r.check("harness", False, error=f"{type(err).__name__}: {err}")
     finally:
@@ -378,11 +561,12 @@ def main() -> int:
             shutil.rmtree(work, ignore_errors=True)
 
     meta["elapsedSeconds"] = round(time.time() - started, 1)
-    passed = sum(c["ok"] for c in r.checks)
-    summary = {"summary": {"passed": passed, "total": len(r.checks), "ok": passed == len(r.checks)}, "meta": meta, "checks": r.checks}
+    totals = summarize(r.checks)
+    summary = {"summary": totals, "meta": meta, "checks": r.checks}
     (evidence / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    log(f"{passed}/{len(r.checks)} checks passed; evidence in {evidence}")
-    return 0 if passed == len(r.checks) else 1
+    skipped = [c["check"] for c in r.checks if c["result"] == "SKIP"]
+    log(f"{totals['passed']}/{totals['total']} checks passed, {totals['failed']} failed, {totals['skipped']} skipped{' (' + ', '.join(skipped) + ')' if skipped else ''}; evidence in {evidence}")
+    return 0 if totals["ok"] else 1
 
 
 if __name__ == "__main__":
