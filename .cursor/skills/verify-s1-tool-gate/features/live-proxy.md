@@ -10,7 +10,7 @@ Denied and unapproved calls never reach kaia-mcp. The proxy will not start if ka
 ## Sub-features
 
 - `proxy-allow-encode` (required allow path, offline): `encode_function_data` with a `kaia:encode` token returns `balanceOf` calldata (`0x70a08231…`) from kaia-mcp. `Mcp-Session-Id` from `initialize` is passed through.
-- `proxy-allow-read` (optional): `get_block_number` returns live mainnet data. It needs the public Kaia RPC. When the RPC is unreachable, the check is `SKIP` with a `skipReason`; it is not a failure.
+- `proxy-allow-read` (optional): `get_block_number` returns live mainnet data. It needs the public Kaia RPC. When the RPC is unreachable before the call, the check is `SKIP` with a `skipReason`; it is not a failure. Once the call has run, any failure is `FAIL`.
 - `proxy-deny-scope`: `encode_function_data` with a `kaia:read kaia:wallet` token gets `-32050` `claims_insufficient_scope`, and kaia-mcp logs no `Tool call` for it.
 - `proxy-escalate-wallet`: `generate_wallet` gets `-32051` `claims_wallet_escalate` with an `escalationId`. The queue shows that id as `pending` for the token's `sub`. kaia-mcp logs no `Tool call` for it.
 - `proxy-escalation-approve-once`: after `python -m claims_gate escalations approve <id>`, exactly one identical retry reaches kaia-mcp (one `tool=generate_wallet` line), and kaia-mcp itself answers `tool_disabled`. The row becomes `consumed`. The next retry gets `-32051` with a new id.
@@ -72,7 +72,7 @@ Preconditions:
 
 ## Gotchas
 
-- `allow-read` is the only check allowed to SKIP. The harness probes the RPC with `eth_blockNumber` before the call, and again if the call fails. To exercise the SKIP path on purpose, set `KAIA_RPC_URL=http://127.0.0.1:9` for the drive; kaia-mcp inherits it too. A SKIP is reported as skipped, never as verified.
+- `allow-read` is the only check allowed to SKIP. The harness probes the RPC with `eth_blockNumber` before the call and SKIPs only if that probe fails. It never re-probes after the call: once `get_block_number` has run, any failure (including an exception) is `FAIL` with `rpcProbe` recording the pre-call probe, so an RPC outage after the call cannot hide a gate bug. To exercise the SKIP path on purpose, set `KAIA_RPC_URL=http://127.0.0.1:9` for the drive; kaia-mcp inherits it too. A SKIP is reported as skipped, never as verified.
 - kaia-mcp's access-token TTL is 15s in the e2e. Each phase logs in fresh so later checks do not race it. Only `expired-denied` waits out the first token.
 - The pinned clone runs `npm ci`, which takes a minute or more. Pointing `S1_VERIFY_KAIA_DIR` at a checkout with `node_modules` already installed is faster.
 - kaia-mcp's `Tool call` line is logged before kaia-mcp's own scope and `tool_disabled` checks. Zero lines therefore means the proxy did not forward the call. One line would not prove kaia-mcp allowed it, which is why the approved `generate_wallet` retry still ends in `tool_disabled`.
