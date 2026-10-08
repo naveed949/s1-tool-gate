@@ -10,7 +10,11 @@
   [S1_INTROSPECTION_CLIENT_ID=... S1_INTROSPECTION_CLIENT_SECRET=...] \
   python -m claims_gate proxy --upstream URL --issuer ISS --audience AUD [--port N]
       [--introspection auto|URL] [--jwks-uri URL] [--tool-scopes-url URL | --no-drift-check]
+      [--drift-interval SECONDS] [--introspection-cache-ttl SECONDS]
       [--audit-log FILE] [--wallet-default escalate|deny]
+      [--escalation-dir DIR [--escalation-pending-ttl S] [--escalation-approval-ttl S]]
+  python -m claims_gate escalations list [--status STATUS] [--dir DIR]
+  python -m claims_gate escalations approve|deny ID [--dir DIR]
 
 ``decide`` reads the Authorization value from the ``S1_AUTHORIZATION`` env var
 (or ``--authorization-file``) so tokens stay out of argv. It prints the
@@ -18,8 +22,17 @@ decision JSON and exits 0 for any decision; exit 2 is a usage/config error.
 ``demo`` exits 0 only when every golden case matched.
 ``proxy`` prints its startup report as JSON, then ``ready: ...``, and serves
 until interrupted. It exits 3 without listening if discovery, the JWKS, the
-introspection setup, or the tool-scope drift check fails (fail closed).
-Introspection credentials come from the environment, never argv.
+introspection setup, or the tool-scope drift check fails, or a setting is
+invalid (e.g. a negative ``--drift-interval``) (fail closed).
+While serving it rechecks the tool-scope map once when it starts listening and
+then every ``--drift-interval`` seconds (default 60; 0 = startup only) and denies every ``tools/call`` while
+the maps differ or the map cannot be fetched.
+Introspection credentials come from the environment, never argv. The
+introspection cache is off by default (every request is introspected); a
+positive ``--introspection-cache-ttl`` opts in and bounds revocation latency.
+``escalations`` reads the queue in ``--dir`` (default ``$S1_ESCALATION_DIR``),
+prints JSON, and exits 0; 1 if the approve/deny is not allowed from the
+escalation's current state; 2 if no queue directory was given.
 """
 
 from __future__ import annotations
@@ -27,6 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -91,6 +105,32 @@ def _cmd_decide(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_escalations(args: argparse.Namespace) -> int:
+    from claims_gate.escalations import EscalationError, EscalationStore
+
+    directory = args.dir or os.environ.get("S1_ESCALATION_DIR")
+    if not directory:
+        print("claims_gate escalations: pass --dir or set S1_ESCALATION_DIR", file=sys.stderr)
+        return 2
+    store = EscalationStore(directory)
+    if args.action == "list":
+        if args.id:
+            print("claims_gate escalations list takes no id", file=sys.stderr)
+            return 2
+        print(json.dumps([e.to_dict() for e in store.list(args.status)], indent=2))
+        return 0
+    if not args.id:
+        print(f"claims_gate escalations {args.action}: missing escalation id", file=sys.stderr)
+        return 2
+    try:
+        rec = store.approve(args.id) if args.action == "approve" else store.deny(args.id)
+    except EscalationError as err:
+        print(f"claims_gate escalations {args.action}: {err}", file=sys.stderr)
+        return 1
+    print(json.dumps(rec.to_dict(), indent=2))
+    return 0
+
+
 def _cmd_proxy(args: argparse.Namespace) -> int:
     import logging
     import threading
@@ -108,6 +148,16 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
             with lock, audit_path.open("a") as fh:
                 fh.write(json.dumps(record, sort_keys=True) + "\n")
 
+    escalations = None
+    if args.escalation_dir:
+        from claims_gate.escalations import EscalationStore
+
+        try:
+            escalations = EscalationStore(args.escalation_dir, pending_ttl=args.escalation_pending_ttl, approval_ttl=args.escalation_approval_ttl)
+        except (OSError, ValueError, sqlite3.Error) as err:
+            print(f"claims_gate proxy: refusing to start (fail closed): escalation queue: {err}", file=sys.stderr, flush=True)
+            return 3
+
     config, report = build_config(
         upstream=args.upstream,
         issuer=args.issuer,
@@ -117,11 +167,14 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
         introspection=args.introspection,
         introspection_client_id=os.environ.get("S1_INTROSPECTION_CLIENT_ID") or None,
         introspection_client_secret=os.environ.get("S1_INTROSPECTION_CLIENT_SECRET") or None,
+        introspection_cache_ttl=args.introspection_cache_ttl,
         tool_scopes_url=args.tool_scopes_url,
         drift_check=not args.no_drift_check,
+        drift_interval=args.drift_interval,
         jwks_ttl_seconds=args.jwks_ttl,
         mcp_path=args.mcp_path,
         audit=audit,
+        escalations=escalations,
     )
     print(json.dumps({"startup": report.to_dict()}), flush=True)
     if config is None:
@@ -129,17 +182,21 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
         return 3
     server = make_server(config, args.host, args.port)
     host, port = server.server_address[:2]
+    if config.drift is not None:
+        config.drift.start()
     print(f"ready: s1-tool-gate proxy on http://{host}:{port}{args.mcp_path} -> {args.upstream}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if config.drift is not None:
+            config.drift.stop()
         server.server_close()
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m claims_gate")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -176,16 +233,31 @@ def main(argv: list[str] | None = None) -> int:
     p_proxy.add_argument("--jwks-uri", help="override discovery's jwks_uri (also allows a different origin)")
     p_proxy.add_argument("--jwks-ttl", type=float, default=300.0)
     p_proxy.add_argument("--introspection", help="'auto' (discovery) or an RFC 7662 URL; credentials from S1_INTROSPECTION_CLIENT_ID/SECRET")
+    p_proxy.add_argument("--introspection-cache-ttl", type=float, default=0.0, help="opt-in: seconds to cache active=true introspection answers (bounded by token exp). Default 0 = off, every request is introspected and a revocation applies on the next request. With a TTL, a revoked token stays usable at the proxy for up to that long")
     p_proxy.add_argument("--tool-scopes-url", help="default: <upstream>/.well-known/kaia-mcp/tool-scopes")
-    p_proxy.add_argument("--no-drift-check", action="store_true", help="skip the startup tool-scope drift check (not recommended)")
+    p_proxy.add_argument("--no-drift-check", action="store_true", help="skip the tool-scope drift check entirely (not recommended)")
+    p_proxy.add_argument("--drift-interval", type=float, default=60.0, help="seconds between tool-scope map rechecks while serving; drift or fetch failure denies every tools/call until fixed (0 = startup check only; negative = refuse to start)")
     p_proxy.add_argument("--host", default="127.0.0.1")
     p_proxy.add_argument("--port", type=int, default=0)
     p_proxy.add_argument("--mcp-path", default="/")
     p_proxy.add_argument("--audit-log", help="append one JSON line per decision (no tokens)")
     p_proxy.add_argument("--wallet-default", choices=["escalate", "deny"], default="escalate")
+    p_proxy.add_argument("--escalation-dir", default=os.environ.get("S1_ESCALATION_DIR") or None, help="durable escalation queue (sqlite) so humans can approve one retry; default $S1_ESCALATION_DIR; unset = escalations are terminal")
+    p_proxy.add_argument("--escalation-pending-ttl", type=float, default=3600.0, help="seconds a pending escalation waits for a human (also how long a deny sticks)")
+    p_proxy.add_argument("--escalation-approval-ttl", type=float, default=300.0, help="seconds an approval stays usable for its one retry")
     p_proxy.set_defaults(func=_cmd_proxy)
 
-    args = parser.parse_args(argv)
+    p_esc = sub.add_parser("escalations", help="list, approve, or deny queued escalations")
+    p_esc.add_argument("action", choices=["list", "approve", "deny"])
+    p_esc.add_argument("id", nargs="?")
+    p_esc.add_argument("--dir", help="queue directory (default $S1_ESCALATION_DIR)")
+    p_esc.add_argument("--status", choices=["pending", "approved", "denied", "expired", "consumed"])
+    p_esc.set_defaults(func=_cmd_escalations)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     return int(args.func(args))
 
 

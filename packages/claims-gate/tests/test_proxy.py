@@ -18,16 +18,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import pytest
+from claims_gate.escalations import EscalationStore, args_hash
 from claims_gate.kaia import KAIA_TOOL_SCOPES, kaia_policy
 from claims_gate.proxy import (
+    DEFAULT_INTROSPECTION_CACHE_TTL,
     DENY_CODE,
     ESCALATE_CODE,
+    DriftMonitor,
+    Introspector,
     JwksCache,
     UpstreamError,
     build_config,
     check_tool_scope_drift,
     make_server,
 )
+from claims_gate.reasons import ClaimsReason
 from claims_gate.testkit import TestSigner, build_claims, unsigned_token
 
 GATEWAY = ("gw-client", "gw-test-secret")
@@ -39,9 +44,11 @@ class FakeKaia:
     issuer: str = ""
     revoked: set[str] = field(default_factory=set)
     introspection_status: int = 200
+    tool_scopes_status: int = 200
     tool_scopes: dict[str, str] = field(default_factory=lambda: dict(KAIA_TOOL_SCOPES))
     mcp_requests: list[dict[str, Any]] = field(default_factory=list)
     jwks_fetches: int = 0
+    introspection_calls: int = 0
     sse: bool = False
 
 
@@ -69,7 +76,7 @@ def _fake_handler(state: FakeKaia) -> type[BaseHTTPRequestHandler]:
                 state.jwks_fetches += 1
                 self._json(200, state.signer.jwks())
             elif self.path == "/.well-known/kaia-mcp/tool-scopes":
-                self._json(200, {"resource": "kaia-mcp", "tool_scopes": state.tool_scopes})
+                self._json(state.tool_scopes_status, {"resource": "kaia-mcp", "tool_scopes": state.tool_scopes})
             else:
                 self._mcp(b"")
 
@@ -80,6 +87,8 @@ def _fake_handler(state: FakeKaia) -> type[BaseHTTPRequestHandler]:
             body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
             if self.path == "/oauth/introspect":
                 import base64
+
+                state.introspection_calls += 1
 
                 expected = "Basic " + base64.b64encode(f"{GATEWAY[0]}:{GATEWAY[1]}".encode()).decode()
                 if self.headers.get("Authorization") != expected:
@@ -121,6 +130,7 @@ class Rig:
     proxy_port: int
     audit: list[dict[str, Any]]
     now: float
+    config: Any = None
 
     def token(self, scope: str = "kaia:read", *, signer: TestSigner | None = None, **kw: Any) -> str:
         claims = build_claims(now=self.now, iss=kw.pop("iss", self.fake.issuer), scope=scope, **kw)
@@ -139,6 +149,13 @@ class Rig:
         return r.status, {k.lower(): v for k, v in r.getheaders()}, data
 
 
+class _FakeUpstreamServer(ThreadingHTTPServer):
+    # Same backlog as the proxy, so a concurrency test measures the proxy, not this fake
+    # (socketserver's default of 5 made the fake drop forwarded/introspection connections).
+    request_queue_size = 128
+    daemon_threads = True
+
+
 def _serve(server: ThreadingHTTPServer) -> threading.Thread:
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -149,9 +166,9 @@ def _serve(server: ThreadingHTTPServer) -> threading.Thread:
 def rig_factory() -> Iterator[Any]:
     servers: list[ThreadingHTTPServer] = []
 
-    def make(*, introspection: bool = True, audience: str = "kaia-mcp", fake: FakeKaia | None = None) -> Rig:
+    def make(*, introspection: bool = True, audience: str = "kaia-mcp", fake: FakeKaia | None = None, **config_kw: Any) -> Rig:
         fake = fake or FakeKaia(signer=TestSigner.generate(kid="kid-1"))
-        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _fake_handler(fake))
+        upstream = _FakeUpstreamServer(("127.0.0.1", 0), _fake_handler(fake))
         servers.append(upstream)
         _serve(upstream)
         fake.issuer = f"http://127.0.0.1:{upstream.server_address[1]}"
@@ -165,12 +182,13 @@ def rig_factory() -> Iterator[Any]:
             introspection_client_id=GATEWAY[0],
             introspection_client_secret=GATEWAY[1],
             audit=audit.append,
+            **config_kw,
         )
         assert config is not None, report.errors
         proxy = make_server(config)
         servers.append(proxy)
         _serve(proxy)
-        return Rig(fake, proxy.server_address[1], audit, time.time())
+        return Rig(fake, proxy.server_address[1], audit, time.time(), config)
 
     yield make
     for s in servers:
@@ -182,7 +200,7 @@ def _err(data: bytes) -> dict[str, Any]:
     return json.loads(data)["error"]
 
 
-CALL = lambda tool, i=1: {"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": tool, "arguments": {}}}
+CALL = lambda tool, i=1, args=None: {"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": tool, "arguments": args if args is not None else {}}}
 
 
 def test_allow_forwards_unchanged_with_session_and_auth(rig_factory: Any) -> None:
@@ -275,13 +293,24 @@ def test_proxy_audience_pin_rejects_kaia_tokens(rig_factory: Any) -> None:
 
 
 def test_revoked_token_denied_via_introspection(rig_factory: Any) -> None:
-    rig = rig_factory()
+    rig = rig_factory()  # default: introspection cache off -> revocation applies on the very next request
     tok = rig.token("kaia:read")
     assert rig.post(CALL("get_block_number"), tok)[0] == 200
     rig.fake.revoked.add(tok)
     status, _, data = rig.post(CALL("get_block_number"), tok)
     assert (status, _err(data)["data"]["reasonCode"]) == (401, "claims_token_revoked")
     assert len(rig.fake.mcp_requests) == 1
+
+
+def test_introspection_cache_is_off_by_default_every_request_introspected(rig_factory: Any) -> None:
+    assert DEFAULT_INTROSPECTION_CACHE_TTL == 0
+    rig = rig_factory()
+    assert rig.config.introspector is not None
+    assert rig.config.introspector.cache_ttl == 0
+    tok = rig.token("kaia:read")
+    for i in range(3):
+        assert rig.post(CALL("get_block_number", i + 1), tok)[0] == 200
+    assert rig.fake.introspection_calls == 3
 
 
 def test_introspection_failure_fails_closed(rig_factory: Any) -> None:
@@ -405,3 +434,419 @@ def test_build_config_fails_closed() -> None:
     assert cfg is None and rep.errors == ["tool-scope drift check failed"]
     cfg, rep = build_config(**kw, drift_check=False, fetch=fetcher(good, {"get_block": "kaia:read"}))
     assert cfg is not None
+
+
+# ---- escalation queue (approve once) ----------------------------------------
+
+
+def test_wallet_escalation_is_queued_with_its_id(rig_factory: Any, tmp_path: Any) -> None:
+    store = EscalationStore(tmp_path / "esc")
+    rig = rig_factory(escalations=store)
+    status, _, data = rig.post(CALL("generate_wallet", 5, {"label": "x"}), rig.token("kaia:wallet", sub="alice"))
+    err = _err(data)
+    assert (status, err["code"], err["data"]["reasonCode"]) == (200, ESCALATE_CODE, "claims_wallet_escalate")
+    [rec] = store.list()
+    assert err["data"]["escalationId"] == rec.id
+    assert err["data"]["escalationStatus"] == "pending"
+    assert (rec.sub, rec.tool, rec.args_hash, rec.status) == ("alice", "generate_wallet", args_hash({"label": "x"}), "pending")
+    assert rig.fake.mcp_requests == []
+    assert rig.audit[-1]["escalationId"] == rec.id
+
+
+def test_approved_escalation_forwards_exactly_one_matching_retry(rig_factory: Any, tmp_path: Any) -> None:
+    store = EscalationStore(tmp_path / "esc")
+    rig = rig_factory(escalations=store)
+    tok = rig.token("kaia:wallet", sub="alice")
+    eid = _err(rig.post(CALL("generate_wallet"), tok)[2])["data"]["escalationId"]
+    store.approve(eid)
+    # different args or a different subject do not use the approval
+    assert _err(rig.post(CALL("generate_wallet", 2, {"n": 1}), tok)[2])["code"] == ESCALATE_CODE
+    assert _err(rig.post(CALL("generate_wallet", 3), rig.token("kaia:wallet", sub="mallory"))[2])["code"] == ESCALATE_CODE
+    assert rig.fake.mcp_requests == []
+    # the matching retry (fresh token, same subject) goes through once
+    status, _, data = rig.post(CALL("generate_wallet", 4), rig.token("kaia:wallet", sub="alice"))
+    assert status == 200 and json.loads(data)["result"] == {"echo": "tools/call"}
+    assert len(rig.fake.mcp_requests) == 1
+    assert rig.audit[-1]["event"] == "allow" and rig.audit[-1]["stage"] == "escalation" and rig.audit[-1]["escalationId"] == eid
+    assert store.get(eid).status == "consumed"
+    err = _err(rig.post(CALL("generate_wallet", 5), tok)[2])
+    assert err["code"] == ESCALATE_CODE and err["data"]["escalationId"] != eid
+    assert len(rig.fake.mcp_requests) == 1
+
+
+def test_approval_is_spent_even_when_the_upstream_call_fails(rig_factory: Any, tmp_path: Any) -> None:
+    """Pinned (fail closed): the approval is consumed before forwarding; a failed upstream call re-escalates."""
+    import socket
+
+    store = EscalationStore(tmp_path / "esc")
+    rig = rig_factory(escalations=store)
+    eid = _err(rig.post(CALL("generate_wallet"), rig.token("kaia:wallet", sub="alice"))[2])["data"]["escalationId"]
+    store.approve(eid)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        dead = f"http://127.0.0.1:{s.getsockname()[1]}"
+    live_upstream, rig.config.upstream = rig.config.upstream, dead
+    status, _, data = rig.post(CALL("generate_wallet", 2), rig.token("kaia:wallet", sub="alice"))
+    assert status == 502 and json.loads(data)["error"]["data"]["choice"] == "allow"
+    assert store.get(eid).status == "consumed"  # spent on the failed call
+    assert rig.audit[-1]["event"] == "upstream_error" and rig.audit[-1]["stage"] == "escalation" and rig.audit[-1]["escalationId"] == eid
+    rig.config.upstream = live_upstream  # upstream back: the same retry needs a new approval
+    err = _err(rig.post(CALL("generate_wallet", 3), rig.token("kaia:wallet", sub="alice"))[2])
+    assert err["code"] == ESCALATE_CODE and err["data"]["escalationId"] != eid and err["data"]["escalationStatus"] == "pending"
+    assert rig.fake.mcp_requests == []
+
+
+def test_approval_never_overrides_a_scope_deny(rig_factory: Any, tmp_path: Any) -> None:
+    store = EscalationStore(tmp_path / "esc")
+    rig = rig_factory(escalations=store)
+    eid = _err(rig.post(CALL("generate_wallet"), rig.token("kaia:wallet", sub="alice"))[2])["data"]["escalationId"]
+    store.approve(eid)
+    err = _err(rig.post(CALL("generate_wallet"), rig.token("kaia:read", sub="alice"))[2])
+    assert (err["code"], err["data"]["reasonCode"]) == (DENY_CODE, "claims_insufficient_scope")
+    assert rig.fake.mcp_requests == [] and store.get(eid).status == "approved"
+
+
+def test_denied_escalation_retry_is_denied(rig_factory: Any, tmp_path: Any) -> None:
+    store = EscalationStore(tmp_path / "esc")
+    rig = rig_factory(escalations=store)
+    tok = rig.token("kaia:wallet", sub="alice")
+    eid = _err(rig.post(CALL("generate_wallet"), tok)[2])["data"]["escalationId"]
+    store.deny(eid)
+    err = _err(rig.post(CALL("generate_wallet", 2), tok)[2])
+    assert err["code"] == DENY_CODE
+    assert err["data"]["reasonCode"] == "claims_escalation_denied" and err["data"]["escalationId"] == eid
+    assert rig.fake.mcp_requests == []
+
+
+def test_escalation_store_failure_fails_closed(rig_factory: Any) -> None:
+    class Broken:
+        def on_escalate(self, *a: Any, **k: Any) -> Any:
+            import sqlite3
+
+            raise sqlite3.OperationalError("disk I/O error")
+
+    rig = rig_factory(escalations=Broken())
+    err = _err(rig.post(CALL("generate_wallet"), rig.token("kaia:wallet"))[2])
+    assert (err["code"], err["data"]["reasonCode"]) == (DENY_CODE, "claims_escalation_unavailable")
+    assert rig.fake.mcp_requests == []
+
+
+def test_escalation_without_a_queue_is_terminal(rig_factory: Any) -> None:
+    rig = rig_factory()
+    err = _err(rig.post(CALL("generate_wallet"), rig.token("kaia:wallet"))[2])
+    assert err["code"] == ESCALATE_CODE and err["data"]["escalationStatus"] == "not_queued" and err["data"]["escalationId"]
+
+
+# ---- periodic tool-scope drift recheck ---------------------------------------
+
+
+def _health(rig: Rig) -> dict[str, Any]:
+    conn = http.client.HTTPConnection("127.0.0.1", rig.proxy_port, timeout=10)
+    conn.request("GET", "/health")
+    data = json.loads(conn.getresponse().read())
+    conn.close()
+    return data
+
+
+def test_drift_at_runtime_fails_closed_then_recovers(rig_factory: Any, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="claims_gate.proxy")
+    rig = rig_factory(drift_interval=3600)
+    monitor = rig.config.drift
+    assert isinstance(monitor, DriftMonitor) and monitor.ok
+    tok = rig.token("kaia:read")
+    assert rig.post(CALL("get_block_number"), tok)[0] == 200
+    assert len(rig.fake.mcp_requests) == 1
+
+    rig.fake.tool_scopes["get_block_number"] = "kaia:encode"
+    assert monitor.check_once()["ok"] is False
+    status, _, data = rig.post(CALL("get_block_number", 2), tok)
+    err = _err(data)
+    assert (status, err["code"], err["data"]["reasonCode"]) == (200, DENY_CODE, "claims_tool_scope_drift")
+    assert err["data"]["drift"]["scopeChanged"] == {"get_block_number": {"gate": "kaia:read", "upstream": "kaia:encode"}}
+    assert len(rig.fake.mcp_requests) == 1  # not forwarded
+    assert rig.audit[-1]["event"] == "deny" and rig.audit[-1]["stage"] == "drift"
+    assert _health(rig)["toolScopes"]["ok"] is False
+    # other MCP traffic still needs only a valid token
+    assert rig.post({"jsonrpc": "2.0", "id": 9, "method": "tools/list"}, tok)[0] == 200
+
+    rig.fake.tool_scopes["get_block_number"] = "kaia:read"
+    assert monitor.check_once()["ok"] is True
+    assert rig.post(CALL("get_block_number", 3), tok)[0] == 200
+    assert json.loads(rig.fake.mcp_requests[-1]["body"])["id"] == 3
+    assert _health(rig)["toolScopes"]["ok"] is True
+    transitions = [r.getMessage() for r in caplog.records if "tool-scope map" in r.getMessage()]
+    assert len(transitions) == 2
+    assert "ok -> drift" in transitions[0] and "drift -> ok" in transitions[1]
+    assert [a["event"] for a in rig.audit if a["event"].startswith("drift_")] == ["drift_failing", "drift_recovered"]
+
+
+def test_tool_scope_map_fetch_failure_fails_closed(rig_factory: Any) -> None:
+    rig = rig_factory(drift_interval=3600)
+    tok = rig.token("kaia:read")
+    rig.fake.tool_scopes_status = 503
+    report = rig.config.drift.check_once()
+    assert report["ok"] is False and "503" in report["error"]
+    err = _err(rig.post(CALL("get_block_number"), tok)[2])
+    assert err["data"]["reasonCode"] == "claims_tool_scope_drift" and "503" in err["data"]["drift"]["error"]
+    rig.config.drift.check_once()  # still failing: no second transition
+    assert [a["event"] for a in rig.audit if a["event"].startswith("drift_")] == ["drift_failing"]
+    rig.fake.tool_scopes_status = 200
+    rig.config.drift.check_once()
+    assert rig.post(CALL("get_block_number"), tok)[0] == 200
+    assert len(rig.fake.mcp_requests) == 1
+
+
+def test_drift_monitor_rechecks_on_its_interval() -> None:
+    served = [dict(KAIA_TOOL_SCOPES)]
+    calls = {"n": 0}
+
+    def fetch(url: str, **_: Any) -> tuple[int, Any]:
+        calls["n"] += 1
+        return 200, {"tool_scopes": served[0]}
+
+    monitor = DriftMonitor("u", KAIA_TOOL_SCOPES, interval=0.05, fetch=fetch)
+    assert monitor.check_once()["ok"] and monitor.ok
+    monitor.start()
+    try:
+        served[0] = {"get_block": "kaia:read"}
+        deadline = time.time() + 5
+        while monitor.ok and time.time() < deadline:
+            time.sleep(0.02)
+        assert monitor.ok is False
+        served[0] = dict(KAIA_TOOL_SCOPES)
+        deadline = time.time() + 5
+        while not monitor.ok and time.time() < deadline:
+            time.sleep(0.02)
+        assert monitor.ok is True and calls["n"] >= 3
+    finally:
+        monitor.stop()
+    n = calls["n"]
+    time.sleep(0.2)
+    assert calls["n"] == n  # stopped
+
+
+def test_drift_monitor_starts_failed_closed_without_a_passing_check() -> None:
+    monitor = DriftMonitor("u", KAIA_TOOL_SCOPES, interval=60, fetch=lambda url, **_: (200, {"tool_scopes": dict(KAIA_TOOL_SCOPES)}))
+    assert monitor.ok is False  # no check yet: closed
+    monitor.check_once()
+    assert monitor.ok is True
+    with pytest.raises(ValueError):
+        DriftMonitor("u", KAIA_TOOL_SCOPES, interval=0)
+
+
+def test_drift_monitor_first_periodic_check_runs_immediately_on_start() -> None:
+    """No blind window: the periodic thread checks at t=0, not after a full interval."""
+    calls = {"n": 0}
+
+    def fetch(url: str, **_: Any) -> tuple[int, Any]:
+        calls["n"] += 1
+        return 200, {"tool_scopes": dict(KAIA_TOOL_SCOPES)}
+
+    monitor = DriftMonitor("u", KAIA_TOOL_SCOPES, interval=3600, fetch=fetch)
+    assert monitor.ok is False
+    monitor.start()
+    try:
+        deadline = time.time() + 5
+        while calls["n"] == 0 and time.time() < deadline:
+            time.sleep(0.01)
+        assert calls["n"] == 1 and monitor.ok is True
+    finally:
+        monitor.stop()
+
+
+def test_build_config_rejects_negative_drift_interval() -> None:
+    signer = TestSigner.generate()
+    issuer = "http://idp.test:1"
+
+    def fetch(url: str, **_: Any) -> tuple[int, Any]:
+        if url.endswith("/openid-configuration"):
+            return 200, {"issuer": issuer, "jwks_uri": issuer + "/jwks"}
+        if url.endswith("/tool-scopes"):
+            return 200, {"tool_scopes": dict(KAIA_TOOL_SCOPES)}
+        return 200, signer.jwks()
+
+    kw: dict[str, Any] = {"upstream": issuer, "issuer": issuer, "audience": "kaia-mcp", "policy": kaia_policy(), "fetch": fetch}
+    cfg, rep = build_config(**kw, drift_interval=-1)
+    assert cfg is None and any("drift interval" in e for e in rep.errors), rep.errors
+    cfg, rep = build_config(**kw, drift_interval=0)
+    assert cfg is not None and cfg.drift is None
+
+
+def test_build_config_drift_interval_zero_means_startup_check_only(rig_factory: Any) -> None:
+    rig = rig_factory(drift_interval=0)
+    assert rig.config.drift is None
+
+
+# ---- introspection TTL cache --------------------------------------------------
+
+
+class _IntrospectionFake:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.answer: Any = (200, {"active": True})
+
+    def __call__(self, url: str, **kw: Any) -> tuple[int, Any]:
+        self.calls += 1
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+
+def _introspector(ttl: float, now: list[float], fake: _IntrospectionFake, **kw: Any) -> Introspector:
+    return Introspector("http://idp/introspect", "c", "s", fetch=fake, cache_ttl=ttl, clock=lambda: now[0], **kw)
+
+
+def test_introspection_cache_hits_within_ttl_then_refetches() -> None:
+    now, fake = [1000.0], _IntrospectionFake()
+    intro = _introspector(10, now, fake)
+    assert intro.check("tok-a", expires_at=2000) is None
+    now[0] = 1009.9
+    assert intro.check("tok-a", expires_at=2000) is None
+    assert fake.calls == 1  # cached
+    assert intro.check("tok-b", expires_at=2000) is None and fake.calls == 2  # per token
+    now[0] = 1010.0
+    assert intro.check("tok-a", expires_at=2000) is None and fake.calls == 3  # TTL over
+
+
+def test_introspection_cache_revocation_latency_is_bounded_by_ttl() -> None:
+    now, fake = [1000.0], _IntrospectionFake()
+    intro = _introspector(5, now, fake)
+    assert intro.check("tok", expires_at=2000) is None
+    fake.answer = (200, {"active": False})  # revoked at the IdP
+    now[0] = 1004.0
+    assert intro.check("tok", expires_at=2000) is None  # documented tradeoff: still cached
+    now[0] = 1005.0
+    assert intro.check("tok", expires_at=2000) is ClaimsReason.TOKEN_REVOKED
+
+
+def test_introspection_never_caches_inactive_or_errors() -> None:
+    now, fake = [1000.0], _IntrospectionFake()
+    intro = _introspector(30, now, fake)
+    fake.answer = (200, {"active": False})
+    assert [intro.check("tok", expires_at=2000) for _ in range(3)] == [ClaimsReason.TOKEN_REVOKED] * 3
+    assert fake.calls == 3
+    for answer in (UpstreamError("down"), (503, {"error": "x"}), (200, {"active": "yes"}), (200, None)):
+        fake.answer = answer
+        assert intro.check("tok", expires_at=2000) is ClaimsReason.INTROSPECTION_UNAVAILABLE
+        assert intro.check("tok", expires_at=2000) is ClaimsReason.INTROSPECTION_UNAVAILABLE
+    assert fake.calls == 3 + 8
+    fake.answer = (200, {"active": True})
+    assert intro.check("tok", expires_at=2000) is None and fake.calls == 12
+
+
+def test_introspection_cache_is_bounded_by_token_exp() -> None:
+    now, fake = [1000.0], _IntrospectionFake()
+    intro = _introspector(30, now, fake)
+    assert intro.check("tok", expires_at=1002) is None
+    now[0] = 1001.9
+    assert intro.check("tok", expires_at=1002) is None and fake.calls == 1
+    now[0] = 1002.0
+    assert intro.check("tok", expires_at=1002) is None and fake.calls == 2  # entry dropped at exp
+    assert intro.check("tok2", expires_at=None) is None
+    assert intro.check("tok2", expires_at=None) is None and fake.calls == 4  # no exp known: never cached
+
+
+def test_introspector_default_never_caches() -> None:
+    fake = _IntrospectionFake()
+    intro = Introspector("http://idp/introspect", "c", "s", fetch=fake)
+    assert intro.cache_ttl == 0
+    assert [intro.check("tok", expires_at=time.time() + 600) for _ in range(3)] == [None] * 3
+    assert fake.calls == 3 and intro._cache == {}
+    fake.answer = (200, {"active": False})
+    assert intro.check("tok", expires_at=time.time() + 600) is ClaimsReason.TOKEN_REVOKED
+
+
+def test_introspection_cache_ttl_zero_disables_and_keys_are_hashes() -> None:
+    now, fake = [1000.0], _IntrospectionFake()
+    off = _introspector(0, now, fake)
+    for _ in range(3):
+        assert off.check("tok", expires_at=2000) is None
+    assert fake.calls == 3
+    on = _introspector(10, now, fake, max_entries=2)
+    for t in ("secret-token-1", "secret-token-2", "secret-token-3"):
+        on.check(t, expires_at=2000)
+    assert len(on._cache) <= 2
+    assert not any("secret-token" in k for k in on._cache)
+    with pytest.raises(ValueError):
+        _introspector(-1, now, fake)
+
+
+def test_proxy_introspection_cache_end_to_end(rig_factory: Any) -> None:
+    rig = rig_factory(introspection_cache_ttl=0.5)
+    tok = rig.token("kaia:read")
+    assert rig.post(CALL("get_block_number"), tok)[0] == 200
+    rig.fake.revoked.add(tok)
+    assert rig.post(CALL("get_block_number", 2), tok)[0] == 200  # within the cache TTL
+    time.sleep(0.6)
+    status, _, data = rig.post(CALL("get_block_number", 3), tok)
+    assert (status, _err(data)["data"]["reasonCode"]) == (401, "claims_token_revoked")
+    status, _, data = rig.post(CALL("get_block_number", 4), tok)
+    assert (status, _err(data)["data"]["reasonCode"]) == (401, "claims_token_revoked")  # inactive not cached as allow
+
+
+# ---- listen backlog ------------------------------------------------------------
+
+BURST = 20
+
+
+def test_proxy_listen_backlog_holds_a_20_connection_burst(rig_factory: Any) -> None:
+    """All 20 connections are accepted by the kernel even while the accept loop is busy."""
+    import socket
+
+    rig = rig_factory()
+    server = make_server(rig.config)  # listening, but not accepting yet
+    port = server.server_address[1]
+    socks: list[socket.socket] = []
+    errors: list[str] = []
+    thread: threading.Thread | None = None
+    try:
+        for _ in range(BURST):
+            c = socket.socket()
+            c.settimeout(0.5)
+            try:
+                c.connect(("127.0.0.1", port))
+                c.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                socks.append(c)
+            except OSError as err:
+                errors.append(type(err).__name__)
+                c.close()
+        assert errors == [] and len(socks) == BURST, errors
+        thread = _serve(server)
+        for c in socks:
+            c.settimeout(10)
+            data = b""
+            while chunk := c.recv(65536):
+                data += chunk
+            assert data.startswith((b"HTTP/1.0 200", b"HTTP/1.1 200")), data[:80]
+    finally:
+        for c in socks:
+            c.close()
+        if thread is not None:  # shutdown() blocks forever unless serve_forever is running
+            server.shutdown()
+            thread.join(timeout=5)
+        server.server_close()
+
+
+def test_proxy_serves_20_concurrent_requests_without_resets(rig_factory: Any) -> None:
+    rig = rig_factory()
+    tok = rig.token("kaia:read")
+    barrier = threading.Barrier(BURST)
+    results: list[Any] = []
+    lock = threading.Lock()
+
+    def one(i: int) -> None:
+        barrier.wait(timeout=10)
+        try:
+            out: Any = rig.post(CALL("get_block_number", i), tok)[0]
+        except OSError as err:  # ConnectionResetError, BrokenPipeError, timeouts
+            out = type(err).__name__
+        with lock:
+            results.append(out)
+
+    threads = [threading.Thread(target=one, args=(i,)) for i in range(BURST)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert results == [200] * BURST, results
+    assert len(rig.fake.mcp_requests) == BURST

@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 from claims_gate.__main__ import main
 from claims_gate.demo import run_demo
 from claims_gate.testkit import PRIVATE_KEY_FILENAME
@@ -80,3 +79,18 @@ def test_no_private_keys_committed_in_package() -> None:
     for path in PACKAGE_ROOT.rglob("*"):
         if path.is_file() and path.suffix in {".py", ".json", ".md", ".toml"}:
             assert marker not in path.read_text(), path
+
+
+def test_proxy_cli_introspection_cache_defaults_off_and_is_opt_in() -> None:
+    from claims_gate.__main__ import build_parser
+    from claims_gate.proxy import DEFAULT_INTROSPECTION_CACHE_TTL
+
+    base = ["proxy", "--upstream", "http://127.0.0.1:1", "--issuer", "http://127.0.0.1:1", "--audience", "kaia-mcp"]
+    assert build_parser().parse_args(base).introspection_cache_ttl == 0 == DEFAULT_INTROSPECTION_CACHE_TTL
+    assert build_parser().parse_args([*base, "--introspection-cache-ttl", "5"]).introspection_cache_ttl == 5.0
+
+
+def test_proxy_cli_negative_drift_interval_refuses_to_start(capsys: pytest.CaptureFixture[str]) -> None:
+    rc = main(["proxy", "--upstream", "http://127.0.0.1:9", "--issuer", "http://127.0.0.1:9", "--audience", "kaia-mcp", "--drift-interval", "-1"])
+    assert rc == 3
+    assert "drift interval must be >= 0" in capsys.readouterr().err

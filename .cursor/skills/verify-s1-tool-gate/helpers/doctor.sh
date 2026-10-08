@@ -27,6 +27,7 @@ assert t["walletTools"] == ["generate_wallet"], t["walletTools"]
 ' || fail "kaia fixture mismatch"
 
 "${PY}" -m claims_gate proxy --help > /dev/null || fail "claims_gate has no proxy subcommand"
+"${PY}" -m claims_gate escalations --help > /dev/null || fail "claims_gate has no escalations subcommand"
 # live-proxy prerequisites (only that feature needs them; report, do not fail the others).
 LIVE="node=$(command -v node >/dev/null && node -v || echo missing) npm=$(command -v npm >/dev/null && npm -v || echo missing) git=$(command -v git >/dev/null && echo ok || echo missing)"
 PINNED="$(sed -n 's/^DEFAULT_KAIA_REF = "\([0-9a-f]*\)"/\1/p' packages/claims-gate/e2e/live_kaia.py | cut -c1-7)"

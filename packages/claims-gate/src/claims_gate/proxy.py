@@ -8,7 +8,11 @@ with a JSON-RPC error and are never forwarded.
 For JSON-RPC ``tools/call`` the claims policy decides:
 
 - deny     -> JSON-RPC error ``-32050`` with ``data.reasonCode`` (``claims_*``); not forwarded
-- escalate -> JSON-RPC error ``-32051`` with an escalation id; not forwarded
+- escalate -> JSON-RPC error ``-32051`` with an escalation id; not forwarded.
+              With an escalation queue (``claims_gate.escalations``) the request
+              is recorded as pending; once a human approves it, exactly one
+              retry with the same subject, tool, and arguments hash is
+              forwarded. A human deny makes identical retries ``-32050``.
 - allow    -> the original request is forwarded byte-for-byte, with its
               headers (including ``Authorization`` and ``Mcp-Session-Id``)
 
@@ -22,7 +26,11 @@ The proxy never logs or echoes a token. Logs and the audit file carry a
 At startup the proxy compares its own kaia tool -> scope map with the one the
 upstream publishes at ``/.well-known/kaia-mcp/tool-scopes`` and refuses to
 start on any difference or if the map cannot be fetched (unless the drift
-check is explicitly turned off).
+check is explicitly turned off). While running, ``DriftMonitor`` rechecks the
+map as soon as it starts and then every ``drift_interval`` seconds (a negative
+interval is a startup error; 0 = startup check only); on drift or a failed fetch every
+``tools/call`` is denied (``claims_tool_scope_drift``) until the maps match
+again. State transitions are logged and audited.
 """
 
 from __future__ import annotations
@@ -32,6 +40,7 @@ import hashlib
 import http.client
 import json
 import logging
+import sqlite3
 import threading
 import time
 import uuid
@@ -43,6 +52,7 @@ from urllib.parse import urlencode, urlsplit
 
 import jwt
 
+from claims_gate.escalations import args_hash
 from claims_gate.policy import ToolPolicy
 from claims_gate.reasons import ClaimsReason
 from claims_gate.verify import (
@@ -199,17 +209,74 @@ class JwksCache:
             return self._jwks
 
 
+# Off by default: every request is introspected, so a revocation applies on the very
+# next request. Operators opt in to a positive TTL and accept that revocation latency.
+DEFAULT_INTROSPECTION_CACHE_TTL = 0.0
+
+
 @dataclass
 class Introspector:
-    """RFC 7662 client (``client_secret_basic``). Any failure is reported, never ignored."""
+    """RFC 7662 client (``client_secret_basic``). Any failure is reported, never ignored.
+
+    ``cache_ttl`` defaults to 0 (no cache: every check calls the endpoint, so a
+    revocation applies on the very next request). An opt-in ``cache_ttl`` > 0
+    caches **only** ``active: true`` answers, keyed by the token's sha256, until
+    ``min(now + cache_ttl, token exp)``. Inactive answers and every error are
+    never cached, so a revoked token is accepted for at most ``cache_ttl``
+    seconds after revocation.
+    """
 
     url: str
     client_id: str
     client_secret: str = field(repr=False)
     timeout: float = 3.0
     fetch: JsonFetcher = http_json
+    cache_ttl: float = DEFAULT_INTROSPECTION_CACHE_TTL
+    max_entries: int = 10_000
+    clock: Callable[[], float] = time.time
+    _cache: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
-    def check(self, token: str) -> ClaimsReason | None:
+    def __post_init__(self) -> None:
+        if self.cache_ttl < 0:
+            raise ValueError("introspection cache TTL must be >= 0")
+
+    def _cached_active(self, key: str, now: float) -> bool:
+        with self._lock:
+            deadline = self._cache.get(key)
+            if deadline is None:
+                return False
+            if now >= deadline:
+                del self._cache[key]
+                return False
+            return True
+
+    def _remember_active(self, key: str, now: float, expires_at: float | None) -> None:
+        if self.cache_ttl <= 0 or expires_at is None:
+            return
+        deadline = min(now + self.cache_ttl, float(expires_at))
+        if deadline <= now:
+            return
+        with self._lock:
+            if len(self._cache) >= self.max_entries:
+                for k in [k for k, d in self._cache.items() if d <= now]:
+                    del self._cache[k]
+                if len(self._cache) >= self.max_entries:
+                    self._cache.clear()
+            self._cache[key] = deadline
+
+    def check(self, token: str, expires_at: float | None = None) -> ClaimsReason | None:
+        """``None`` if active. ``expires_at`` is the verified token ``exp``; without it nothing is cached."""
+        key = hashlib.sha256(token.encode()).hexdigest()
+        now = self.clock()
+        if self.cache_ttl > 0 and self._cached_active(key, now):
+            return None
+        reason = self._introspect(token)
+        if reason is None:
+            self._remember_active(key, now, expires_at)
+        return reason
+
+    def _introspect(self, token: str) -> ClaimsReason | None:
         try:
             status, doc = self.fetch(
                 self.url,
@@ -250,6 +317,88 @@ def check_tool_scope_drift(
     }
 
 
+class DriftMonitor:
+    """Periodic tool-scope drift recheck. Closed (``ok`` False) until a check passes, and on any failure."""
+
+    def __init__(
+        self,
+        url: str,
+        expected: Mapping[str, str],
+        *,
+        interval: float = 60.0,
+        fetch: JsonFetcher = http_json,
+        audit: Callable[[dict[str, Any]], None] | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        if interval <= 0:
+            raise ValueError("drift interval must be positive")
+        self.url = url
+        self.expected = dict(expected)
+        self.interval = float(interval)
+        self._fetch = fetch
+        self._audit = audit
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._ok: bool | None = None  # None = never checked (treated as closed)
+        self._report: dict[str, Any] = {"ok": False, "url": url, "error": "not checked yet"}
+        self._checked_at: float | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self._ok is True
+
+    @property
+    def report(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._report)
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return {"ok": self._ok is True, "checkedAt": self._checked_at, "intervalSeconds": self.interval, "url": self.url}
+
+    def record(self, report: dict[str, Any]) -> dict[str, Any]:
+        """Store a check result and log/audit a state transition."""
+        ok = report.get("ok") is True
+        with self._lock:
+            prev = self._ok
+            self._ok, self._report, self._checked_at = ok, dict(report), self._clock()
+        if prev is not None and prev != ok:
+            if ok:
+                LOG.warning("tool-scope map drift -> ok: tools/call allowed again (%s)", self.url)
+            else:
+                summary = {k: report[k] for k in ("error", "missingFromGate", "notUpstream", "scopeChanged") if report.get(k)}
+                LOG.warning("tool-scope map ok -> drift: denying every tools/call until the maps match (%s) %s", self.url, json.dumps(summary, sort_keys=True))
+            if self._audit is not None:
+                self._audit({"ts": time.time(), "event": "drift_recovered" if ok else "drift_failing", "stage": "drift", "drift": report})
+        return report
+
+    def check_once(self) -> dict[str, Any]:
+        try:
+            report = check_tool_scope_drift(self.url, self.expected, fetch=self._fetch)
+        except Exception as err:  # noqa: BLE001 - any failure closes the gate
+            report = {"ok": False, "url": self.url, "error": f"{type(err).__name__}"}
+        return self.record(report)
+
+    def _run(self) -> None:
+        # First check at t=0 (no blind window after start()), then every interval.
+        while not self._stop.is_set():
+            self.check_once()
+            if self._stop.wait(self.interval):
+                break
+
+    def start(self) -> None:
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, name="claims-gate-drift", daemon=True)
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+
 @dataclass
 class ProxyConfig:
     upstream: str
@@ -262,6 +411,8 @@ class ProxyConfig:
     upstream_timeout: float = 120.0
     audit: Callable[[dict[str, Any]], None] | None = None
     algorithms: tuple[str, ...] = ("RS256", "ES256")
+    escalations: Any = None  # claims_gate.escalations.EscalationStore, or None (escalations are terminal)
+    drift: DriftMonitor | None = None  # None: startup check only (or drift check off)
 
 
 @dataclass(frozen=True)
@@ -292,7 +443,7 @@ def check_token(config: ProxyConfig, authorization: str | None) -> TokenCheck:
     if isinstance(verified, ClaimsFailure):
         return TokenCheck(None, verified.reason, fp)
     if config.introspector is not None:
-        reason = config.introspector.check(token)
+        reason = config.introspector.check(token, expires_at=verified.expires_at)
         if reason is not None:
             return TokenCheck(None, reason, fp)
     return TokenCheck(verified, None, fp)
@@ -369,7 +520,8 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if path == "/health" and self.config.mcp_path != "/health":
-            self._send(200, json.dumps({"status": "ok", "server": "s1-tool-gate-proxy", "issuer": self.config.issuer, "audience": self.config.audience, "introspection": self.config.introspector is not None}).encode())
+            tool_scopes = self.config.drift.status() if self.config.drift is not None else {"periodic": False}
+            self._send(200, json.dumps({"status": "ok", "server": "s1-tool-gate-proxy", "issuer": self.config.issuer, "audience": self.config.audience, "introspection": self.config.introspector is not None, "toolScopes": tool_scopes}).encode())
             return
         if path == "/.well-known/oauth-protected-resource":
             self._send(200, json.dumps({"resource": self._base_url() + self.config.mcp_path, "authorization_servers": [self.config.issuer], "bearer_methods_supported": ["header"], "resource_name": "kaia-mcp via s1-tool-gate"}).encode())
@@ -425,6 +577,13 @@ class _Handler(BaseHTTPRequestHandler):
                     self._record(event="deny", stage="request", reasonCode=reason, rpcMethod=rpc_method, tokenFp=check.fp, forwarded=False)
                     self._send(200, _jsonrpc_error(rpc_id, INVALID_REQUEST_CODE, "s1-tool-gate: tools/call without params.name", {"reasonCode": reason, "choice": "deny"}))
                     return
+                drift = self.config.drift
+                if drift is not None and not drift.ok:
+                    reason = ClaimsReason.TOOL_SCOPE_DRIFT.value
+                    report = drift.report
+                    self._record(event="deny", stage="drift", reasonCode=reason, choice="deny", rpcMethod=rpc_method, tool=tool, subject=check.claims.subject, tokenFp=check.fp, forwarded=False)
+                    self._send(200, _jsonrpc_error(rpc_id, DENY_CODE, f"s1-tool-gate denied {tool}: {reason} (upstream tool-scope map differs or is unavailable; failing closed)", {"reasonCode": reason, "choice": "deny", "tool": tool, "drift": report}))
+                    return
                 decision = self.config.policy.decide(check.claims, tool)
                 base = {
                     "rpcMethod": rpc_method,
@@ -440,13 +599,48 @@ class _Handler(BaseHTTPRequestHandler):
                     self._send(200, _jsonrpc_error(rpc_id, DENY_CODE, f"s1-tool-gate denied {tool}: {decision.reason_code}", {"reasonCode": decision.reason_code, "choice": "deny", "tool": tool, "requiredScope": base["requiredScope"]}))
                     return
                 if decision.choice == "escalate":
-                    escalation_id = str(uuid.uuid4())
-                    self._record(event="escalate", stage="policy", forwarded=False, escalationId=escalation_id, **base)
-                    self._send(200, _jsonrpc_error(rpc_id, ESCALATE_CODE, f"s1-tool-gate escalated {tool}: human review required; not executed", {"reasonCode": decision.reason_code, "choice": "escalate", "tool": tool, "escalationId": escalation_id}))
+                    self._escalate(body, rpc_id, tool, params, check.claims.subject, decision.reason_code, base)
                     return
                 self._forward(body, event_fields={"event": "allow", "stage": "policy", **base})
                 return
         self._forward(body, event_fields={"event": "forward", "stage": "token", "rpcMethod": rpc_method, "tokenFp": check.fp, "subject": check.claims.subject})
+
+    def _escalate(self, body: bytes, rpc_id: Any, tool: str, params: dict[str, Any], subject: str, reason_code: str, base: dict[str, Any]) -> None:
+        """Escalate, or let one human-approved retry through. Any queue error fails closed."""
+        store = self.config.escalations
+        if store is None:
+            escalation_id = str(uuid.uuid4())
+            self._record(event="escalate", stage="policy", forwarded=False, escalationId=escalation_id, escalationStatus="not_queued", **base)
+            self._send(200, _jsonrpc_error(rpc_id, ESCALATE_CODE, f"s1-tool-gate escalated {tool}: human review required; not executed", {"reasonCode": reason_code, "choice": "escalate", "tool": tool, "escalationId": escalation_id, "escalationStatus": "not_queued"}))
+            return
+        ahash = args_hash(params.get("arguments"))
+        try:
+            outcome = store.on_escalate(subject, tool, ahash, reason_code)
+        except (sqlite3.Error, OSError) as err:
+            reason = ClaimsReason.ESCALATION_UNAVAILABLE.value
+            self._record(event="deny", stage="escalation", forwarded=False, queueError=type(err).__name__, **{**base, "reasonCode": reason, "choice": "deny"})
+            self._send(200, _jsonrpc_error(rpc_id, DENY_CODE, f"s1-tool-gate denied {tool}: {reason}", {"reasonCode": reason, "choice": "deny", "tool": tool}))
+            return
+        esc = outcome.escalation
+        fields = {"escalationId": esc.id, "escalationStatus": esc.status, "argsHash": ahash}
+        if outcome.action == "allow":
+            self._forward(body, event_fields={"event": "allow", "stage": "escalation", **base, "choice": "allow", **fields})
+            return
+        if outcome.action == "deny":
+            reason = ClaimsReason.ESCALATION_DENIED.value
+            self._record(event="deny", stage="escalation", forwarded=False, **{**base, "reasonCode": reason, "choice": "deny"}, **fields)
+            self._send(200, _jsonrpc_error(rpc_id, DENY_CODE, f"s1-tool-gate denied {tool}: {reason}", {"reasonCode": reason, "choice": "deny", "tool": tool, "escalationId": esc.id}))
+            return
+        self._record(event="escalate", stage="policy", forwarded=False, **base, **fields)
+        self._send(
+            200,
+            _jsonrpc_error(
+                rpc_id,
+                ESCALATE_CODE,
+                f"s1-tool-gate escalated {tool}: human review required; not executed (escalation {esc.id})",
+                {"reasonCode": reason_code, "choice": "escalate", "tool": tool, **fields, "expiresAt": esc.expires_at},
+            ),
+        )
 
     def _forward(self, body: bytes | None, *, event_fields: dict[str, Any]) -> None:
         up = urlsplit(self.config.upstream)
@@ -493,11 +687,19 @@ class _Handler(BaseHTTPRequestHandler):
             conn.close()
 
 
+# listen(2) backlog. socketserver's default (5) let the kernel drop connections
+# under a modest burst (~20 concurrent clients); the kernel caps this at somaxconn.
+LISTEN_BACKLOG = 128
+
+
+class _ProxyHTTPServer(ThreadingHTTPServer):
+    request_queue_size = LISTEN_BACKLOG
+    daemon_threads = True
+
+
 def make_server(config: ProxyConfig, host: str = "127.0.0.1", port: int = 0) -> ThreadingHTTPServer:
     handler = type("ClaimsGateProxyHandler", (_Handler,), {"config": config})
-    server = ThreadingHTTPServer((host, port), handler)
-    server.daemon_threads = True
-    return server
+    return _ProxyHTTPServer((host, port), handler)
 
 
 @dataclass
@@ -530,11 +732,14 @@ def build_config(
     introspection: str | None = None,
     introspection_client_id: str | None = None,
     introspection_client_secret: str | None = None,
+    introspection_cache_ttl: float = DEFAULT_INTROSPECTION_CACHE_TTL,
     tool_scopes_url: str | None = None,
     drift_check: bool = True,
+    drift_interval: float = 60.0,
     jwks_ttl_seconds: float = 300.0,
     mcp_path: str = "/",
     audit: Callable[[dict[str, Any]], None] | None = None,
+    escalations: Any = None,
     fetch: JsonFetcher = http_json,
 ) -> tuple[ProxyConfig | None, StartupReport]:
     """Resolve discovery, JWKS, introspection, and the drift check. Fail closed: any error -> no config.
@@ -543,6 +748,8 @@ def build_config(
     or an explicit URL. When introspection is on, missing credentials are an error.
     """
     errors: list[str] = []
+    if drift_interval < 0:
+        errors.append(f"drift interval must be >= 0 (got {drift_interval}); 0 = startup check only")
     resolved_jwks = jwks_uri
     introspection_url: str | None = None
     try:
@@ -570,13 +777,21 @@ def build_config(
         if not introspection_client_id or not introspection_client_secret:
             errors.append("introspection is configured but S1_INTROSPECTION_CLIENT_ID/SECRET are not set")
         else:
-            introspector = Introspector(introspection_url, introspection_client_id, introspection_client_secret, fetch=fetch)
+            try:
+                introspector = Introspector(introspection_url, introspection_client_id, introspection_client_secret, fetch=fetch, cache_ttl=introspection_cache_ttl)
+            except ValueError as err:
+                errors.append(f"introspection: {err}")
 
     drift = None
+    monitor = None
     if drift_check:
-        drift = check_tool_scope_drift(tool_scopes_url or upstream.rstrip("/") + TOOL_SCOPES_PATH, policy.tool_scopes, fetch=fetch)
+        scopes_url = tool_scopes_url or upstream.rstrip("/") + TOOL_SCOPES_PATH
+        drift = check_tool_scope_drift(scopes_url, policy.tool_scopes, fetch=fetch)
         if not drift["ok"]:
             errors.append("tool-scope drift check failed")
+        elif drift_interval > 0:
+            monitor = DriftMonitor(scopes_url, policy.tool_scopes, interval=drift_interval, fetch=fetch, audit=audit)
+            monitor.record(drift)
 
     cache = JwksCache(resolved_jwks or "", ttl_seconds=jwks_ttl_seconds, fetch=fetch)
     if resolved_jwks and not errors:
@@ -598,6 +813,8 @@ def build_config(
             introspector=introspector,
             mcp_path=mcp_path,
             audit=audit,
+            escalations=escalations,
+            drift=monitor,
         ),
         report,
     )
