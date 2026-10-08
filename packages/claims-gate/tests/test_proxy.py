@@ -605,6 +605,44 @@ def test_drift_monitor_starts_failed_closed_without_a_passing_check() -> None:
         DriftMonitor("u", KAIA_TOOL_SCOPES, interval=0)
 
 
+def test_drift_monitor_first_periodic_check_runs_immediately_on_start() -> None:
+    """No blind window: the periodic thread checks at t=0, not after a full interval."""
+    calls = {"n": 0}
+
+    def fetch(url: str, **_: Any) -> tuple[int, Any]:
+        calls["n"] += 1
+        return 200, {"tool_scopes": dict(KAIA_TOOL_SCOPES)}
+
+    monitor = DriftMonitor("u", KAIA_TOOL_SCOPES, interval=3600, fetch=fetch)
+    assert monitor.ok is False
+    monitor.start()
+    try:
+        deadline = time.time() + 5
+        while calls["n"] == 0 and time.time() < deadline:
+            time.sleep(0.01)
+        assert calls["n"] == 1 and monitor.ok is True
+    finally:
+        monitor.stop()
+
+
+def test_build_config_rejects_negative_drift_interval() -> None:
+    signer = TestSigner.generate()
+    issuer = "http://idp.test:1"
+
+    def fetch(url: str, **_: Any) -> tuple[int, Any]:
+        if url.endswith("/openid-configuration"):
+            return 200, {"issuer": issuer, "jwks_uri": issuer + "/jwks"}
+        if url.endswith("/tool-scopes"):
+            return 200, {"tool_scopes": dict(KAIA_TOOL_SCOPES)}
+        return 200, signer.jwks()
+
+    kw: dict[str, Any] = {"upstream": issuer, "issuer": issuer, "audience": "kaia-mcp", "policy": kaia_policy(), "fetch": fetch}
+    cfg, rep = build_config(**kw, drift_interval=-1)
+    assert cfg is None and any("drift interval" in e for e in rep.errors), rep.errors
+    cfg, rep = build_config(**kw, drift_interval=0)
+    assert cfg is not None and cfg.drift is None
+
+
 def test_build_config_drift_interval_zero_means_startup_check_only(rig_factory: Any) -> None:
     rig = rig_factory(drift_interval=0)
     assert rig.config.drift is None

@@ -88,3 +88,9 @@ def test_proxy_cli_introspection_cache_defaults_off_and_is_opt_in() -> None:
     base = ["proxy", "--upstream", "http://127.0.0.1:1", "--issuer", "http://127.0.0.1:1", "--audience", "kaia-mcp"]
     assert build_parser().parse_args(base).introspection_cache_ttl == 0 == DEFAULT_INTROSPECTION_CACHE_TTL
     assert build_parser().parse_args([*base, "--introspection-cache-ttl", "5"]).introspection_cache_ttl == 5.0
+
+
+def test_proxy_cli_negative_drift_interval_refuses_to_start(capsys: pytest.CaptureFixture[str]) -> None:
+    rc = main(["proxy", "--upstream", "http://127.0.0.1:9", "--issuer", "http://127.0.0.1:9", "--audience", "kaia-mcp", "--drift-interval", "-1"])
+    assert rc == 3
+    assert "drift interval must be >= 0" in capsys.readouterr().err

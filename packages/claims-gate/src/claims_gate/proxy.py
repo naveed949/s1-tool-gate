@@ -27,7 +27,8 @@ At startup the proxy compares its own kaia tool -> scope map with the one the
 upstream publishes at ``/.well-known/kaia-mcp/tool-scopes`` and refuses to
 start on any difference or if the map cannot be fetched (unless the drift
 check is explicitly turned off). While running, ``DriftMonitor`` rechecks the
-map every ``drift_interval`` seconds; on drift or a failed fetch every
+map as soon as it starts and then every ``drift_interval`` seconds (a negative
+interval is a startup error; 0 = startup check only); on drift or a failed fetch every
 ``tools/call`` is denied (``claims_tool_scope_drift``) until the maps match
 again. State transitions are logged and audited.
 """
@@ -381,8 +382,11 @@ class DriftMonitor:
         return self.record(report)
 
     def _run(self) -> None:
-        while not self._stop.wait(self.interval):
+        # First check at t=0 (no blind window after start()), then every interval.
+        while not self._stop.is_set():
             self.check_once()
+            if self._stop.wait(self.interval):
+                break
 
     def start(self) -> None:
         if self._thread is None:
@@ -736,6 +740,8 @@ def build_config(
     or an explicit URL. When introspection is on, missing credentials are an error.
     """
     errors: list[str] = []
+    if drift_interval < 0:
+        errors.append(f"drift interval must be >= 0 (got {drift_interval}); 0 = startup check only")
     resolved_jwks = jwks_uri
     introspection_url: str | None = None
     try:

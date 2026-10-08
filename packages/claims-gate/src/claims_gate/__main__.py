@@ -22,9 +22,10 @@ decision JSON and exits 0 for any decision; exit 2 is a usage/config error.
 ``demo`` exits 0 only when every golden case matched.
 ``proxy`` prints its startup report as JSON, then ``ready: ...``, and serves
 until interrupted. It exits 3 without listening if discovery, the JWKS, the
-introspection setup, or the tool-scope drift check fails (fail closed).
-While serving it rechecks the tool-scope map every ``--drift-interval``
-seconds (default 60; 0 = startup only) and denies every ``tools/call`` while
+introspection setup, or the tool-scope drift check fails, or a setting is
+invalid (e.g. a negative ``--drift-interval``) (fail closed).
+While serving it rechecks the tool-scope map once when it starts listening and
+then every ``--drift-interval`` seconds (default 60; 0 = startup only) and denies every ``tools/call`` while
 the maps differ or the map cannot be fetched.
 Introspection credentials come from the environment, never argv. The
 introspection cache is off by default (every request is introspected); a
@@ -235,7 +236,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_proxy.add_argument("--introspection-cache-ttl", type=float, default=0.0, help="opt-in: seconds to cache active=true introspection answers (bounded by token exp). Default 0 = off, every request is introspected and a revocation applies on the next request. With a TTL, a revoked token stays usable at the proxy for up to that long")
     p_proxy.add_argument("--tool-scopes-url", help="default: <upstream>/.well-known/kaia-mcp/tool-scopes")
     p_proxy.add_argument("--no-drift-check", action="store_true", help="skip the tool-scope drift check entirely (not recommended)")
-    p_proxy.add_argument("--drift-interval", type=float, default=60.0, help="seconds between tool-scope map rechecks while serving; drift or fetch failure denies every tools/call until fixed (0 = startup check only)")
+    p_proxy.add_argument("--drift-interval", type=float, default=60.0, help="seconds between tool-scope map rechecks while serving; drift or fetch failure denies every tools/call until fixed (0 = startup check only; negative = refuse to start)")
     p_proxy.add_argument("--host", default="127.0.0.1")
     p_proxy.add_argument("--port", type=int, default=0)
     p_proxy.add_argument("--mcp-path", default="/")
