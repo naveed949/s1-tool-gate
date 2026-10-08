@@ -39,7 +39,7 @@ The live proxy (below) adds deny codes of its own:
 
 ## kaia-mcp fixture
 
-`claims_gate.kaia` copies kaia-mcp's real tool → scope map from `naveed949/kaia-mcp@253d6c8:src/auth/scopes.ts` (still identical at `00f3511`, the live e2e pin):
+`claims_gate.kaia` copies kaia-mcp's real tool → scope map from `naveed949/kaia-mcp@253d6c8:src/auth/scopes.ts` (still identical at `00f3511` and at `5794969`, the live e2e pin):
 
 - `kaia:read` covers 24 read tools (`get_kaia_balance`, `get_block`, `read_contract`, `estimate_gas`, ...).
 - `kaia:encode` covers `encode_function_data`.
@@ -90,7 +90,7 @@ python -m claims_gate proxy --upstream http://127.0.0.1:3100 \
   --port 3200 --audit-log /tmp/s1-audit.jsonl
 ```
 
-It targets kaia-mcp `00f3511` or later (MCP 2026-07-28, stateless). See [Audience and kaia's canonical URL](#audience-and-kaias-canonical-url) and [Stateless kaia-mcp](#stateless-kaia-mcp-mcp-2026-07-28).
+It targets kaia-mcp `00f3511` or later (MCP 2026-07-28, stateless); the live e2e pins `5794969` (naveed949/kaia-mcp#7, MCP SDK v2). See [Audience and kaia's canonical URL](#audience-and-kaias-canonical-url) and [Stateless kaia-mcp](#stateless-kaia-mcp-mcp-2026-07-28).
 
 - **Every request** on the MCP path needs a bearer token that verifies against the issuer's JWKS, with the **pinned** issuer and audience. That includes `initialize`, `tools/list`, notifications, `GET`, and `DELETE`.
   - The JWKS comes from the discovery `jwks_uri`. Discovery's `issuer` must equal `--issuer`, and the `jwks_uri` must be on the issuer's origin unless you pass `--jwks-uri`.
@@ -108,10 +108,17 @@ It targets kaia-mcp `00f3511` or later (MCP 2026-07-28, stateless). See [Audienc
 - **`tools/call`** runs the claims policy:
   - **deny** → JSON-RPC error `-32050`, `data: {reasonCode, choice, tool, requiredScope}`. Not forwarded.
   - **escalate** (`generate_wallet`) → JSON-RPC error `-32051`, `data: {reasonCode: "claims_wallet_escalate", escalationId, escalationStatus, …}`. Not forwarded. With `--escalation-dir` a human can approve one retry (see [Escalation queue](#escalation-queue)).
-  - **allow** → the request body is forwarded byte-for-byte with its headers, line for line, but never `Mcp-Session-Id` (see below). The `Authorization` sent upstream is exactly the value the proxy verified. The response, including SSE, is streamed back.
-  - Decisions use the JSON-RPC body, which is what kaia-mcp executes. `Mcp-Method` / `Mcp-Name` headers are forwarded unchanged but never trusted.
+  - **allow** → the request body is forwarded byte-for-byte with its end-to-end headers, line for line. Not forwarded: hop-by-hop headers (`Connection`, `Keep-Alive`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, `Proxy-Authorization`, `Proxy-Authenticate`, `Proxy-Connection`), every header the client names in `Connection` (RFC 9110 §7.6.1), `Host` and `Content-Length` (recomputed), and `Mcp-Session-Id` (see below). A folded (obs-fold) header line is never forwarded: it is refused (below). The `Authorization` sent upstream is exactly the value the proxy verified. The response, including SSE, is streamed back, minus the same hop-by-hop and `Connection`-named headers.
+  - Decisions use the JSON-RPC body, which is what kaia-mcp executes. `Mcp-Method` / `Mcp-Name` / `MCP-Protocol-Version` headers are forwarded unchanged but never trusted; kaia-mcp `5794969`+ checks them against the body itself (HTTP 400, JSON-RPC `-32020` HeaderMismatch, relayed as is).
 - JSON-RPC **batches are rejected** (`claims_malformed_request`), so a batch cannot hide a `tools/call`.
-- **Ambiguous headers are rejected** before the token is checked: HTTP 400, JSON-RPC `-32600`, `claims_malformed_request`, `data.header`, audited as a `deny` and never forwarded. That covers more than one `Authorization`, `Host`, `Content-Length`, `Content-Type`, `Origin`, `Mcp-Method`, `Mcp-Name`, or `MCP-Protocol-Version` line, and a comma-joined `Authorization` value. Otherwise the proxy could verify one token (the first line) while kaia-mcp runs the call with another (the last).
+- **Ambiguous or malformed headers are rejected** before the token is checked: HTTP 400, JSON-RPC `-32600`, `claims_malformed_request`, `data.header`, audited as a `deny` and never forwarded. That covers:
+  - a header line that does not parse as `name: value`: whitespace before the colon, a continuation line first, a bare CR (RFC 9112 §5.1), reported as `data.header: "header-block"`;
+  - a value with CR or LF, i.e. an obs-fold continuation line (RFC 9112 §5.2 lets a proxy reject it), or any other control character (C0 except HTAB, and DEL) in any header, e.g. `Authorization: Bearer \x1c<token>`;
+  - more than one `Authorization`, `Host`, `Content-Length`, `Content-Type`, `Origin`, `Mcp-Method`, `Mcp-Name`, or `MCP-Protocol-Version` line, a comma-joined `Authorization` value, or a non-ASCII byte in any of those headers;
+  - a `Content-Length` that is not plain ASCII digits (`+390`, `3_9_0`, `390 `), or `Transfer-Encoding` together with `Content-Length` (RFC 9112 §6.1);
+  - `Connection` naming one of those headers (dropping it as hop-by-hop would make the upstream see a different request from the one the proxy checked).
+
+  The rule is that the proxy decides only on a request that every HTTP parser reads the same way. Which of two `Authorization` lines a server uses is parser-specific (Node, under kaia-mcp, keeps the *first*; other stacks keep the last or join them), and a lenient parser downstream could read a folded continuation as a new header. Refusing the request means the proxy never has to guess. `Transfer-Encoding` without `Content-Length` is not decoded either: the proxy reads no body, never forwards `Transfer-Encoding`, and answers 400 because the body is not a JSON-RPC object.
 - **No token is logged.** Each decision is one log line and, with `--audit-log`, one JSON line with `event`, `reasonCode`, `tool`, `subject`, `forwarded`, and a 12-char token fingerprint.
 - `GET /health` and `GET /.well-known/oauth-protected-resource` are served by the proxy itself. The latter points `authorization_servers` at the issuer.
 - The proxy listens with a backlog of 128 (capped by the kernel's `somaxconn`), so a burst of concurrent clients is queued rather than dropped. Each connection is handled on its own thread.
@@ -187,7 +194,10 @@ Approval only turns an *escalate* into one allow. The claims policy runs first, 
 - `generate_wallet` is escalated, queued as `pending`, and never forwarded.
   - After `escalations approve <id>`, exactly one identical retry reaches kaia-mcp. kaia-mcp itself still refuses it (`tool_disabled`). The next retry is escalated again with a new id.
   - After `escalations deny <id>`, the identical retry gets `claims_escalation_denied`.
-- `initialize` through the proxy succeeds with no `Mcp-Session-Id` (stateless kaia-mcp), with the proxy's `--audience` pinned to kaia's canonical URL.
+- `initialize` through the proxy succeeds with no `Mcp-Session-Id` (stateless kaia-mcp, 2025-era client on kaia's legacy fallback), with the proxy's `--audience` pinned to kaia's canonical URL.
+- MCP 2026-07-28 clients work through the proxy: `server/discover` (`supportedVersions` includes `2026-07-28`), `tools/list` (kaia's `cacheScope: "private"`, `ttlMs: 0`, scope-filtered), and `tools/call`, all with `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` headers and the `_meta` envelope.
+- `Mcp-Name` is relayed but never trusted: a body the token may not call is denied at the proxy whatever `Mcp-Name` says, and an allowed body with a mismatching `Mcp-Name` is forwarded as sent and refused by kaia-mcp itself (`-32020`).
+- Through a raw TCP tap between a proxy and kaia-mcp: folded, CR/LF, control-character, malformed-line, `Transfer-Encoding` + `Content-Length`, non-digit `Content-Length`, and `Connection: Authorization` requests are refused with not one byte reaching kaia-mcp; a request whose `Connection` names `X-Nominated` reaches kaia-mcp without `X-Nominated` or `Proxy-Connection`, and with exactly the one `Authorization` line that was sent (`header-tap.jsonl`, tokens redacted).
 - Forged, wrong-audience, and expired tokens are denied.
 - A token revoked at kaia-mcp still verifies offline, yet with the default settings the proxy denies it with `claims_token_revoked` on the very next request, without forwarding it.
 - A separate proxy that opts in with `--introspection-cache-ttl 3` forwards the revoked token only while its cache entry lives, and kaia-mcp refuses it on its own. After the TTL that proxy denies it with `claims_token_revoked` every time.

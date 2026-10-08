@@ -14,15 +14,26 @@ For JSON-RPC ``tools/call`` the claims policy decides:
               retry with the same subject, tool, and arguments hash is
               forwarded. A human deny makes identical retries ``-32050``.
 - allow    -> the original request body is forwarded byte-for-byte, with its
-              headers line for line (including ``Mcp-Method``/``Mcp-Name``); the
+              end-to-end headers line for line (including ``Mcp-Method``/``Mcp-Name``);
+              hop-by-hop headers, headers named in ``Connection``, ``Proxy-Connection``,
+              ``Host``, ``Content-Length`` and ``Mcp-Session-Id`` are not forwarded. The
               ``Authorization`` sent upstream is exactly the value the gate verified
 
-Ambiguous requests are refused with HTTP 400 (``claims_malformed_request``) before
-the token is even checked: more than one ``Authorization``, ``Host``,
-``Content-Length``, ``Content-Type``, ``Origin``, ``Mcp-Method``, ``Mcp-Name``, or
-``MCP-Protocol-Version`` header line, or a comma-joined ``Authorization`` value.
-Otherwise the gate could decide on one copy (``headers.get`` returns the first)
-while the upstream acts on another.
+Ambiguous or malformed requests are refused with HTTP 400 (``claims_malformed_request``)
+before the token is even checked, so the gate never decides on one reading of a header
+block that the upstream (or an intermediary) could parse differently:
+
+- a header line the parser could not take as ``name: value`` (whitespace before the
+  colon, a continuation as the first line, a bare CR): RFC 9112 5.1;
+- a header value with CR or LF, i.e. an obs-fold continuation line (RFC 9112 5.2),
+  or any other control character (C0 except HTAB, or DEL);
+- more than one ``Authorization``, ``Host``, ``Content-Length``, ``Content-Type``,
+  ``Origin``, ``Mcp-Method``, ``Mcp-Name``, or ``MCP-Protocol-Version`` line, or a
+  comma-joined ``Authorization`` value; a non-ASCII byte in any of those;
+- ``Content-Length`` that is not plain ASCII digits, or ``Transfer-Encoding`` together
+  with ``Content-Length`` (RFC 9112 6.1);
+- ``Connection`` naming one of the headers above (dropping it would change what the
+  upstream sees from what the gate checked).
 
 Other methods (``initialize``, ``tools/list``, notifications, responses) and
 ``GET``/``DELETE`` are forwarded once the token is valid (kaia-mcp >= 00f3511
@@ -108,6 +119,7 @@ _HOP_BY_HOP = frozenset(
         "trailers",
         "transfer-encoding",
         "upgrade",
+        "proxy-connection",  # non-standard, but some clients send it (RFC 9110 7.6.1)
         "host",
         "content-length",
     }
@@ -136,6 +148,20 @@ _SINGLE_VALUED_HEADERS = (
     "Mcp-Name",
     "MCP-Protocol-Version",
 )
+
+_SINGLE_VALUED_LOWER = frozenset(h.lower() for h in _SINGLE_VALUED_HEADERS)
+
+# RFC 9110 5.5: CR, LF and NUL are never valid in a field value; the other C0 controls
+# (HTAB is allowed) and DEL are not either. CR/LF in a parsed value means obs-fold.
+_CTL = frozenset(chr(c) for c in range(0x20) if c != 0x09) | {"\x7f"}
+_DIGITS = frozenset("0123456789")
+_MAX_REPORTED_NAME = 64
+
+
+def _connection_options(values: list[str]) -> set[str]:
+    """Lower-cased header names listed in ``Connection`` lines (RFC 9110 7.6.1)."""
+    return {opt.strip().lower() for v in values for opt in v.split(",") if opt.strip()}
+
 
 JsonFetcher = Callable[..., Any]
 
@@ -573,13 +599,36 @@ class _Handler(BaseHTTPRequestHandler):
         )
 
     def _ambiguous_header(self) -> tuple[str, str] | None:
-        """(header, why) if the request repeats a single-valued header or comma-joins Authorization."""
+        """(header, why) if the header block is malformed or could be read two ways. See the module docstring."""
+        # The stdlib parser records a line it could not split into name: value as a
+        # defect and silently drops it (and, for some defects, every line after it).
+        if self.headers.defects:
+            return "header-block", f"malformed header line ({type(self.headers.defects[0]).__name__})"
+        for name, value in self.headers.items():
+            shown = name[:_MAX_REPORTED_NAME]
+            if "\r" in value or "\n" in value:
+                return shown, f"obs-fold or CR/LF in {shown} header value"
+            if not _CTL.isdisjoint(value):
+                return shown, f"control character in {shown} header value"
+            if name.lower() in _SINGLE_VALUED_LOWER and not value.isascii():
+                return shown, f"non-ASCII byte in {shown} header value"
         for name in _SINGLE_VALUED_HEADERS:
             if len(self.headers.get_all(name) or []) > 1:
                 return name, f"more than one {name} header"
         # RFC 6750 b64token has no comma; a comma means two credentials joined into one line.
         if "," in (self.headers.get("Authorization") or ""):
             return "Authorization", "comma-joined Authorization header value"
+        length = self.headers.get("Content-Length")
+        if length is not None:
+            # int() also takes "+5", "5_0", " 5 " and non-ASCII digits; RFC 9110 8.6 is 1*DIGIT.
+            if not length or not _DIGITS.issuperset(length):
+                return "Content-Length", "Content-Length is not plain ASCII digits"
+            if self.headers.get("Transfer-Encoding") is not None:
+                return "Transfer-Encoding", "both Transfer-Encoding and Content-Length"
+        listed = _connection_options(self.headers.get_all("Connection") or [])
+        for name in _SINGLE_VALUED_HEADERS:
+            if name.lower() in listed:
+                return "Connection", f"Connection lists the {name} header"
         return None
 
     def _refuse_ambiguous(self) -> bool:
@@ -748,11 +797,13 @@ class _Handler(BaseHTTPRequestHandler):
         if query:
             target += "?" + query
         # Line for line (a dict would keep only the last of repeated lines), and the
-        # Authorization line carries exactly the value check_token verified.
+        # Authorization line carries exactly the value check_token verified. Headers the
+        # client named in Connection are hop-by-hop (RFC 9110 7.6.1) and stop here.
+        skip = _REQUEST_SKIP | _connection_options(self.headers.get_all("Connection") or [])
         headers = [
             (k, authorization if k.lower() == "authorization" else v)
             for k, v in self.headers.items()
-            if k.lower() not in _REQUEST_SKIP
+            if k.lower() not in skip
         ]
         try:
             conn.putrequest(self.command, target, skip_accept_encoding=True)
@@ -770,8 +821,9 @@ class _Handler(BaseHTTPRequestHandler):
         self._record(forwarded=True, upstreamStatus=resp.status, **event_fields)
         try:
             self.send_response(resp.status, resp.reason)
+            resp_skip = _RESPONSE_SKIP | _connection_options(resp.headers.get_all("Connection") or [])
             for k, v in resp.getheaders():
-                if k.lower() not in _RESPONSE_SKIP:
+                if k.lower() not in resp_skip:
                     self.send_header(k, v)
             length = resp.getheader("Content-Length")
             if length is not None:

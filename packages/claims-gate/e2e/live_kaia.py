@@ -4,8 +4,25 @@
 Starts kaia-mcp (pinned commit, or a local checkout), starts the proxy, logs in
 with the device flow against kaia-mcp's demo IdP, and proves:
 
-  initialize-through-proxy   MCP initialize through the proxy; stateless kaia-mcp: no Mcp-Session-Id
-                             (the proxy pins --audience to kaia's canonical URL, the token aud)
+  initialize-through-proxy   MCP initialize through the proxy (2025-era client, kaia's legacy
+                             stateless fallback); no Mcp-Session-Id (the proxy pins --audience to
+                             kaia's canonical URL, the token aud)
+  modern-discover-through-proxy  MCP 2026-07-28 server/discover (MCP-Protocol-Version + Mcp-Method
+                             headers, _meta envelope) through the proxy: supportedVersions has
+                             2026-07-28, no Mcp-Session-Id
+  modern-tools-list-private  modern tools/list through the proxy: kaia's cacheScope "private",
+                             ttlMs 0, scope-filtered list, relayed unchanged
+  modern-call-allow          modern tools/call encode_function_data (Mcp-Name header) -> calldata
+  mcp-headers-relayed-not-trusted  the proxy decides on the body, never on Mcp-Name: a scope-denied
+                             body with a harmless Mcp-Name is denied at the proxy (not forwarded);
+                             an allowed body with a mismatching Mcp-Name is forwarded with the
+                             header as sent and kaia refuses it (400 -32020 HeaderMismatch, relayed)
+  header-hardening-tap       raw TCP tap between a proxy and kaia: obs-fold, CR/LF, control chars,
+                             malformed lines, TE+CL, non-digit Content-Length, and Connection naming
+                             Authorization are refused (400 claims_malformed_request) with 0 bytes
+                             reaching kaia; a request whose Connection lists X-Nominated reaches
+                             kaia without X-Nominated/Proxy-Connection and with exactly the one
+                             Authorization line that was sent
   encode-denied              encode_function_data without kaia:encode denied at the proxy
                              (claims_insufficient_scope); kaia-mcp logs no Tool call for it
   wallet-escalated           generate_wallet escalated (-32051) with a queued escalationId, never forwarded
@@ -49,6 +66,7 @@ in that process's memory.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
 import json
 import os
@@ -72,12 +90,16 @@ from claims_gate.kaia import KAIA_TOOL_SCOPES
 from claims_gate.verify import VerifiedClaims, VerifierConfig, verify_access_token
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-# kaia-mcp main after naveed949/kaia-mcp#6 (squash-merge commit): stateless MCP
-# 2026-07-28 (no Mcp-Session-Id, GET/DELETE 405), RFC 8707 audience = kaia's
-# canonical URL (KAIA_PUBLIC_URL, here http://127.0.0.1:<port>), 403
-# insufficient_scope, per-process revocation-file lock. The tool -> scope map is
-# unchanged since 253d6c8 (#3, first JWT/JWKS/introspection/tool-scopes release).
-DEFAULT_KAIA_REF = "00f35117858a583049ca048d5a12e4d09ed83e85"
+# kaia-mcp main after naveed949/kaia-mcp#7 (squash-merge commit): MCP SDK v2
+# createMcpHandler speaking protocol 2026-07-28 (server/discover, Mcp-Method /
+# Mcp-Name / MCP-Protocol-Version checked against the body: -32020 HeaderMismatch,
+# tools/list cacheScope "private") with the stateless legacy fallback for 2025-era
+# clients. Still from #6 (00f3511): no Mcp-Session-Id, GET/DELETE 405, RFC 8707
+# audience = kaia's canonical URL (KAIA_PUBLIC_URL, here http://127.0.0.1:<port>),
+# 403 insufficient_scope. The tool -> scope map is unchanged since 253d6c8 (#3, first
+# JWT/JWKS/introspection/tool-scopes release); src/auth/scopes.ts is identical at
+# 00f3511 and 5794969.
+DEFAULT_KAIA_REF = "5794969859029ecaa8d4e34d5fee1f6eb25b9d4e"
 DEFAULT_KAIA_REPO = "https://github.com/naveed949/kaia-mcp.git"
 INTROSPECTION_CLIENT_ID = "s1-tool-gate"
 DEFAULT_KAIA_RPC = "https://public-en.node.kaia.io"
@@ -88,6 +110,8 @@ OPT_IN_INTROSPECTION_CACHE_TTL = 3.0
 BALANCE_OF_ABI = json.dumps([{"type": "function", "name": "balanceOf", "inputs": [{"name": "account", "type": "address"}], "outputs": [{"type": "uint256"}], "stateMutability": "view"}])
 BALANCE_OF_ARGS = {"abi": BALANCE_OF_ABI, "functionName": "balanceOf", "args": ["0x1234567890123456789012345678901234567890"]}
 JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+MODERN_PROTOCOL = "2026-07-28"
+MODERN_META = {"io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL, "io.modelcontextprotocol/clientInfo": {"name": "s1-live-e2e", "version": "0"}, "io.modelcontextprotocol/clientCapabilities": {}}
 
 
 def log(msg: str) -> None:
@@ -179,6 +203,101 @@ class Mcp:
         return status, body
 
 
+def modern_post(url: str, token: str, method: str, params: dict[str, Any] | None = None, *, rpc_id: int = 1, mcp_name: str | None = None) -> tuple[int, dict[str, str], Any]:
+    """One MCP 2026-07-28 request: _meta envelope in the body, MCP-Protocol-Version / Mcp-Method
+    (and Mcp-Name for tools/call) headers. ``mcp_name`` overrides the Mcp-Name header."""
+    body = {"jsonrpc": "2.0", "id": rpc_id, "method": method, "params": {**(params or {}), "_meta": MODERN_META}}
+    h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", "Authorization": f"Bearer {token}", "MCP-Protocol-Version": MODERN_PROTOCOL, "Mcp-Method": method}
+    name = mcp_name if mcp_name is not None else (params or {}).get("name")
+    if name is not None:
+        h["Mcp-Name"] = name
+    status, headers, data = request("POST", url, body=json.dumps(body).encode(), headers=h)
+    try:
+        return status, headers, parse_rpc(headers, data)
+    except ValueError:
+        return status, headers, data.decode(errors="replace")
+
+
+class RawTap:
+    """TCP relay in front of kaia-mcp that records every byte a proxy sends it."""
+
+    def __init__(self, target_port: int) -> None:
+        self._sock = socket.socket()
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(16)
+        self.port = int(self._sock.getsockname()[1])
+        self._target = target_port
+        self._lock = threading.Lock()
+        self.connections: list[bytearray] = []
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                client, _ = self._sock.accept()
+            except OSError:
+                return
+            seen = bytearray()
+            with self._lock:
+                self.connections.append(seen)
+            try:
+                upstream = socket.create_connection(("127.0.0.1", self._target))
+            except OSError:
+                client.close()
+                continue
+            threading.Thread(target=self._pump, args=(client, upstream, seen), daemon=True).start()
+            threading.Thread(target=self._pump, args=(upstream, client, None), daemon=True).start()
+
+    @staticmethod
+    def _pump(src: socket.socket, dst: socket.socket, record: bytearray | None) -> None:
+        try:
+            while data := src.recv(65536):
+                if record is not None:
+                    record.extend(data)
+                dst.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for sk in (src, dst):
+                try:
+                    sk.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def raw(self) -> list[bytes]:
+        with self._lock:
+            return [bytes(c) for c in self.connections]
+
+    def close(self) -> None:
+        self._sock.close()
+
+
+def send_raw(port: int, raw: bytes, timeout: float = 30) -> tuple[int, bytes]:
+    """Write exactly ``raw`` to 127.0.0.1:port and read the close-delimited response."""
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sk:
+        sk.sendall(raw)
+        chunks = []
+        while data := sk.recv(65536):
+            chunks.append(data)
+    head, _, body = b"".join(chunks).partition(b"\r\n\r\n")
+    return int(head.split(b" ", 2)[1]), body
+
+
+def raw_post(lines: list[bytes], body: bytes, *, length: bool = True) -> bytes:
+    head = [b"POST / HTTP/1.1", b"Host: 127.0.0.1", b"Content-Type: application/json", b"Accept: application/json, text/event-stream", *lines]
+    if length:
+        head.append(b"Content-Length: " + str(len(body)).encode())
+    return b"\r\n".join(head) + b"\r\n\r\n" + body
+
+
+def redact(raw: bytes, tokens: list[str]) -> str:
+    text = raw.decode("latin-1")
+    for t in tokens:
+        if t:
+            text = text.replace(t, f"<token sha256:{hashlib.sha256(t.encode()).hexdigest()[:12]}>")
+    return text
+
+
 def rpc_reachable(url: str, timeout: float = 8.0) -> tuple[bool, str]:
     """POST eth_blockNumber to a JSON-RPC endpoint. (True, detail) only for a JSON-RPC ``result``."""
     import urllib.error
@@ -197,7 +316,7 @@ def rpc_reachable(url: str, timeout: float = 8.0) -> tuple[bool, str]:
 
 # Artifacts this harness writes into --evidence-dir. Several are appended to, so a
 # reused dir is reset first or a previous run's lines would be counted again.
-EVIDENCE_PATTERNS = ("audit-*.jsonl", "proxy-*.log", "kaia-mcp.log", "setup.log", "escalations-cli.log", "escalations.json", "summary.json")
+EVIDENCE_PATTERNS = ("audit-*.jsonl", "proxy-*.log", "kaia-mcp.log", "setup.log", "escalations-cli.log", "escalations.json", "summary.json", "header-tap.jsonl")
 
 
 def reset_evidence(evidence: Path) -> None:
@@ -224,6 +343,117 @@ def run_allow_read(r: Run, probe: Callable[[], tuple[bool, str]], call: Callable
         r.check("allow-read", False, error=f"{type(err).__name__}: {err}", rpcProbe=detail)
         return
     r.check("allow-read", ok, **observed, rpcProbe=detail)
+
+
+def run_modern_checks(r: Run, proxy_url: str, kaia_url: str, kaia_log: Path, encode_token: str, evidence: Path) -> None:
+    """MCP 2026-07-28 (kaia-mcp SDK v2) through the proxy, and Mcp-Name relayed but never trusted."""
+    st, headers, body = modern_post(proxy_url, encode_token, "server/discover")
+    versions = ((body or {}).get("result") or {}).get("supportedVersions") if isinstance(body, dict) else None
+    r.check("modern-discover-through-proxy", st == 200 and isinstance(versions, list) and MODERN_PROTOCOL in versions and "mcp-session-id" not in headers, status=st, supportedVersions=versions, sessionId="mcp-session-id" in headers)
+
+    st, _, body = modern_post(proxy_url, encode_token, "tools/list", rpc_id=2)
+    result = ((body or {}).get("result") or {}) if isinstance(body, dict) else {}
+    names = sorted(t.get("name") for t in result.get("tools") or [] if isinstance(t, dict))
+    r.check("modern-tools-list-private", st == 200 and result.get("cacheScope") == "private" and result.get("ttlMs") == 0 and names == ["encode_function_data"], status=st, cacheScope=result.get("cacheScope"), ttlMs=result.get("ttlMs"), tools=names)
+
+    before = tool_calls(kaia_log, "encode_function_data")
+    st, _, body = modern_post(proxy_url, encode_token, "tools/call", {"name": "encode_function_data", "arguments": BALANCE_OF_ARGS}, rpc_id=3)
+    text = result_text(body) if isinstance(body, dict) else ""
+    r.check("modern-call-allow", st == 200 and "error" not in (body or {}) and re.fullmatch(r"0x70a08231[0-9a-fA-F]{64}", text.strip()) is not None and tool_calls(kaia_log, "encode_function_data") == before + 1, status=st, resultText=text[:200], kaiaToolCallLines=tool_calls(kaia_log, "encode_function_data"))
+
+    # Relayed, never trusted. A read-only token: encode_function_data in the body is a scope
+    # deny at the proxy even when Mcp-Name names a tool it may call.
+    t = device_login(kaia_url, "kaia:read")
+    r.tokens += [t["access_token"], t["refresh_token"]]
+    read = t["access_token"]
+    audit_main = evidence / "audit-main.jsonl"
+    n_audit = len(audit_main.read_text().splitlines())
+    enc_before, blk_before = tool_calls(kaia_log, "encode_function_data"), tool_calls(kaia_log, "get_block_number")
+    st_deny, _, b_deny = modern_post(proxy_url, read, "tools/call", {"name": "encode_function_data", "arguments": BALANCE_OF_ARGS}, rpc_id=4, mcp_name="get_block_number")
+    # An allowed body (get_block_number needs kaia:read) with a mismatching Mcp-Name: the proxy
+    # forwards it with the header as sent, and kaia's own header check refuses it.
+    st_mm, _, b_mm = modern_post(proxy_url, read, "tools/call", {"name": "get_block_number", "arguments": {"network": "mainnet"}}, rpc_id=5, mcp_name="encode_function_data")
+    new_audit = [json.loads(line) for line in audit_main.read_text().splitlines()[n_audit:] if line.strip()]
+    mm_code = ((b_mm or {}).get("error") or {}).get("code") if isinstance(b_mm, dict) else None
+    r.check(
+        "mcp-headers-relayed-not-trusted",
+        st_deny == 200 and reason(b_deny) == "claims_insufficient_scope" and st_mm == 400 and mm_code == -32020
+        and [(a.get("event"), a.get("tool"), a.get("forwarded"), a.get("upstreamStatus")) for a in new_audit] == [("deny", "encode_function_data", False, None), ("allow", "get_block_number", True, 400)]
+        and tool_calls(kaia_log, "encode_function_data") == enc_before and tool_calls(kaia_log, "get_block_number") == blk_before,
+        scopeDenyByBody={"status": st_deny, "reasonCode": reason(b_deny)}, mismatchForwarded={"status": st_mm, "kaiaCode": mm_code},
+        audit=[{k: a.get(k) for k in ("event", "tool", "forwarded", "upstreamStatus")} for a in new_audit],
+    )
+
+
+# (case, header lines after Host/Content-Type/Accept, add Content-Length) for header-hardening-tap.
+# {tok} is the encode token, {read} a different token; both are replaced before sending.
+TAP_REFUSED: list[tuple[str, list[bytes], bool]] = [
+    ("obs-fold-carrying-authorization", [b"Authorization: Bearer {tok}", b"X-Probe: a", b" Authorization: Bearer {read}"], True),
+    ("crlf-whitespace-continuation", [b"Authorization: Bearer {tok}", b" "], True),
+    ("control-char-in-bearer", [b"Authorization: Bearer \x1c{tok}"], True),
+    ("whitespace-before-colon", [b"Authorization: Bearer {tok}", b"X-A : 1"], True),
+    ("te-plus-cl", [b"Authorization: Bearer {tok}", b"Transfer-Encoding: chunked"], True),
+    ("content-length-plus-sign", [b"Authorization: Bearer {tok}", b"Content-Length: +{n}"], False),
+    ("connection-lists-authorization", [b"Authorization: Bearer {tok}", b"Connection: Authorization"], True),
+]
+
+
+def run_header_tap(r: Run, kaia_url: str, kaia_port: int, token: str, evidence: Path) -> None:
+    """A proxy whose upstream is a raw TCP tap in front of kaia: refused requests send kaia nothing."""
+    tap = RawTap(kaia_port)
+    try:
+        # Only MCP traffic goes through the tap: discovery, JWKS and the tool-scope map come from kaia directly.
+        url, _, _ = start_proxy(r, "tap", f"http://127.0.0.1:{tap.port}", issuer=kaia_url, extra=["--tool-scopes-url", kaia_url + "/.well-known/kaia-mcp/tool-scopes"])
+        port = int(url.rstrip("/").rsplit(":", 1)[1])
+        other = device_login(kaia_url, "kaia:read")
+        r.tokens += [other["access_token"], other["refresh_token"]]
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "encode_function_data", "arguments": BALANCE_OF_ARGS, "_meta": MODERN_META}}).encode()
+        fill = {b"{tok}": token.encode(), b"{read}": other["access_token"].encode(), b"{n}": str(len(body)).encode()}
+        modern_h = [b"MCP-Protocol-Version: " + MODERN_PROTOCOL.encode(), b"Mcp-Method: tools/call", b"Mcp-Name: encode_function_data"]
+        refused: dict[str, Any] = {}
+        # Every refused request is otherwise one kaia-mcp would execute (modern headers, valid body).
+        for case, lines, length in TAP_REFUSED:
+            filled = []
+            for line in lines:
+                for k, v in fill.items():
+                    line = line.replace(k, v)
+                filled.append(line)
+            st, data = send_raw(port, raw_post(modern_h + filled, body, length=length))
+            try:
+                rc = json.loads(data)["error"]["data"]["reasonCode"]
+            except (ValueError, KeyError, TypeError):
+                rc = None
+            refused[case] = {"status": st, "reasonCode": rc}
+        reached_after_refusals = len(tap.raw())
+        auth_line = b"Authorization: Bearer " + token.encode()
+        ok_lines = [auth_line, b"Connection: keep-alive, X-Nominated", b"X-Nominated: hop-only", b"Proxy-Connection: keep-alive", *modern_h]
+        st_ok, data_ok = send_raw(port, raw_post(ok_lines, body))
+        try:
+            ok_text = result_text(json.loads(data_ok) if data_ok.lstrip().startswith(b"{") else parse_rpc({"content-type": "text/event-stream"}, data_ok))
+        except ValueError:
+            ok_text = ""
+        captured = tap.raw()
+        forwarded = captured[0] if len(captured) == 1 else b""
+        head = forwarded.split(b"\r\n\r\n", 1)[0]
+        lower = head.lower()
+        audit = [json.loads(line) for line in (evidence / "audit-tap.jsonl").read_text().splitlines() if line.strip()]
+        with (evidence / "header-tap.jsonl").open("w") as fh:
+            for i, raw in enumerate(captured):
+                fh.write(json.dumps({"connection": i, "bytes": len(raw), "raw": redact(raw, r.tokens)}) + "\n")
+        r.check(
+            "header-hardening-tap",
+            all(v == {"status": 400, "reasonCode": "claims_malformed_request"} for v in refused.values()) and reached_after_refusals == 0
+            and st_ok == 200 and re.fullmatch(r"0x70a08231[0-9a-fA-F]{64}", ok_text.strip()) is not None and len(captured) == 1
+            and b"x-nominated" not in lower and b"hop-only" not in lower and b"proxy-connection" not in lower
+            and lower.count(b"\r\nauthorization:") == 1 and forwarded.count(auth_line + b"\r\n") == 1
+            and b"\r\nmcp-name: encode_function_data" in lower and forwarded.endswith(b"\r\n\r\n" + body)
+            and [a.get("event") for a in audit] == ["deny"] * len(TAP_REFUSED) + ["allow"] and not any(a.get("forwarded") for a in audit[: len(TAP_REFUSED)]),
+            refused=refused, tapConnectionsAfterRefusals=reached_after_refusals, allowedStatus=st_ok, allowedResult=ok_text[:80],
+            tapConnections=len(captured), forwardedHeaderNames=sorted({ln.split(b":", 1)[0].decode("latin-1").lower() for ln in head.split(b"\r\n")[1:] if b":" in ln}),
+            authorizationLinesForwarded=lower.count(b"\r\nauthorization:"), authorizationBytesEqual=forwarded.count(auth_line + b"\r\n") == 1,
+        )
+    finally:
+        tap.close()
 
 
 def summarize(checks: list[dict[str, Any]]) -> dict[str, Any]:
@@ -290,10 +520,11 @@ def prepare_kaia(args: argparse.Namespace, work: Path, run_log: Path) -> tuple[P
     return kaia, rev + ("+dirty" if dirty else "")
 
 
-def start_proxy(r: Run, name: str, kaia_url: str, *, audience: str | None = None, extra: list[str] | None = None, env_extra: dict[str, str] | None = None, expect_ready: bool = True) -> tuple[str, subprocess.Popen[Any], Path]:
+def start_proxy(r: Run, name: str, kaia_url: str, *, audience: str | None = None, issuer: str | None = None, extra: list[str] | None = None, env_extra: dict[str, str] | None = None, expect_ready: bool = True) -> tuple[str, subprocess.Popen[Any], Path]:
+    """``kaia_url`` is the upstream; issuer and audience default to it (kaia's canonical URL)."""
     port = free_port()
     logfile = r.evidence / f"proxy-{name}.log"
-    cmd = [sys.executable, "-m", "claims_gate", "proxy", "--upstream", kaia_url, "--issuer", kaia_url, "--audience", audience or kaia_url, "--port", str(port), "--audit-log", str(r.evidence / f"audit-{name}.jsonl"), *(extra or [])]
+    cmd = [sys.executable, "-m", "claims_gate", "proxy", "--upstream", kaia_url, "--issuer", issuer or kaia_url, "--audience", audience or issuer or kaia_url, "--port", str(port), "--audit-log", str(r.evidence / f"audit-{name}.jsonl"), *(extra or [])]
     env = {**os.environ, **(env_extra or {})}
     p = r.spawn(cmd, cwd=Path.cwd(), env=env, logfile=logfile)
     url = f"http://127.0.0.1:{port}/"
@@ -488,6 +719,9 @@ def main() -> int:
         st, body = m3.call("encode_function_data", BALANCE_OF_ARGS)
         text = result_text(body)
         r.check("allow-encode", st_init == 200 and st == 200 and "error" not in (body or {}) and re.fullmatch(r"0x70a08231[0-9a-fA-F]{64}", text.strip()) is not None and tool_calls(kaia_log, "encode_function_data") == before + 1, status=st, resultText=text[:200], kaiaToolCallLines=tool_calls(kaia_log, "encode_function_data"))
+
+        run_modern_checks(r, proxy_url, kaia_url, kaia_log, t3["access_token"], evidence)
+        run_header_tap(r, kaia_url, kport, t3["access_token"], evidence)
 
         # Default introspection cache (off): revocation applies on the very next request.
         t2 = device_login(kaia_url, "kaia:read")

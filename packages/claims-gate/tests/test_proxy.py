@@ -10,6 +10,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import socket
 import threading
 import time
 from collections.abc import Iterator
@@ -174,19 +175,80 @@ def _serve(server: ThreadingHTTPServer) -> threading.Thread:
     return t
 
 
+class RawTap:
+    """TCP relay that records every byte the proxy sends upstream, one entry per connection."""
+
+    def __init__(self) -> None:
+        self._sock = socket.socket()
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(16)
+        self.port: int = self._sock.getsockname()[1]
+        self.connections: list[bytearray] = []
+        self._lock = threading.Lock()
+        self._target = 0
+
+    def start(self, target_port: int) -> None:
+        self._target = target_port
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                client, _ = self._sock.accept()
+            except OSError:
+                return
+            seen = bytearray()
+            with self._lock:
+                self.connections.append(seen)
+            upstream = socket.create_connection(("127.0.0.1", self._target))
+            threading.Thread(target=self._pump, args=(client, upstream, seen), daemon=True).start()
+            threading.Thread(target=self._pump, args=(upstream, client, None), daemon=True).start()
+
+    @staticmethod
+    def _pump(src: socket.socket, dst: socket.socket, record: bytearray | None) -> None:
+        try:
+            while data := src.recv(65536):
+                if record is not None:
+                    record.extend(data)
+                dst.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for s in (src, dst):
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def raw(self) -> list[bytes]:
+        with self._lock:
+            return [bytes(c) for c in self.connections]
+
+    def close(self) -> None:
+        self._sock.close()
+
+
 @pytest.fixture
 def rig_factory() -> Iterator[Any]:
     servers: list[ThreadingHTTPServer] = []
+    taps: list[RawTap] = []
 
-    def make(*, introspection: bool = True, audience: str = "kaia-mcp", fake: FakeKaia | None = None, **config_kw: Any) -> Rig:
+    def make(*, introspection: bool = True, audience: str = "kaia-mcp", fake: FakeKaia | None = None, tap: RawTap | None = None, **config_kw: Any) -> Rig:
         fake = fake or FakeKaia(signer=TestSigner.generate(kid="kid-1"))
         upstream = _FakeUpstreamServer(("127.0.0.1", 0), _fake_handler(fake))
         servers.append(upstream)
         _serve(upstream)
         fake.issuer = f"http://127.0.0.1:{upstream.server_address[1]}"
+        mcp_upstream = fake.issuer
+        if tap is not None:
+            # Only MCP traffic goes through the tap; metadata is fetched from the fake directly.
+            tap.start(upstream.server_address[1])
+            taps.append(tap)
+            mcp_upstream = f"http://127.0.0.1:{tap.port}"
+            config_kw.setdefault("tool_scopes_url", fake.issuer + "/.well-known/kaia-mcp/tool-scopes")
         audit: list[dict[str, Any]] = []
         config, report = build_config(
-            upstream=fake.issuer,
+            upstream=mcp_upstream,
             issuer=fake.issuer,
             audience=audience,
             policy=kaia_policy(),
@@ -206,6 +268,8 @@ def rig_factory() -> Iterator[Any]:
     for s in servers:
         s.shutdown()
         s.server_close()
+    for t in taps:
+        t.close()
 
 
 def _err(data: bytes) -> dict[str, Any]:
@@ -242,7 +306,8 @@ def test_decision_uses_the_body_not_mcp_name_headers(rig_factory: Any) -> None:
     assert rig.fake.mcp_requests == []
 
 
-# Captured live from kaia-mcp 00f3511 (a token without kaia:encode calling encode_function_data), port normalized.
+# Captured live from kaia-mcp 00f3511 (a token without kaia:encode calling encode_function_data), port normalized;
+# re-captured at 5794969 (MCP SDK v2): same status, headers, challenge and JSON body.
 KAIA_403_WWW = (
     'Bearer realm="kaia-mcp", error="insufficient_scope", scope="kaia:encode", '
     'resource_metadata="http://127.0.0.1:3100/.well-known/oauth-protected-resource", '
@@ -1110,3 +1175,207 @@ def test_forwarded_headers_keep_each_line_and_one_authorization(rig_factory: Any
     [upstream] = [sent[c] for c, (port, url) in targets.items() if port != rig.proxy_port and url == "/"]
     assert [v for k, v in upstream if k.lower() == "authorization"] == [f"Bearer {tok}"]
     assert [v for k, v in upstream if k.lower() == "accept"] == ["application/json", "text/event-stream"]
+
+
+def _raw_request(port: int, method: str, headers: list[tuple[str, str]]) -> tuple[int, bytes]:
+    """A body-less request with exactly these header lines (GET/DELETE)."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.putrequest(method, "/", skip_host=any(k.lower() == "host" for k, _ in headers), skip_accept_encoding=True)
+    for k, v in headers:
+        conn.putheader(k, v)
+    conn.endheaders()
+    r = conn.getresponse()
+    data = r.read()
+    conn.close()
+    return r.status, data
+
+
+@pytest.mark.parametrize("method", ["GET", "DELETE"])
+@pytest.mark.parametrize("name", ["Authorization", "Mcp-Method", "Origin"])
+def test_duplicated_headers_are_refused_on_get_and_delete(rig_factory: Any, method: str, name: str) -> None:
+    """The refusal runs first in do_GET/do_DELETE too, not only do_POST."""
+    rig = rig_factory()
+    a, b = rig.token("kaia:read kaia:encode"), rig.token("kaia:read")
+    values = {"Authorization": [f"Bearer {a}", f"Bearer {b}"], "Mcp-Method": ["tools/call", "tools/list"], "Origin": ["http://127.0.0.1", "http://evil.example"]}[name]
+    headers = [("Host", "127.0.0.1")] + ([("Authorization", f"Bearer {a}")] if name != "Authorization" else [])
+    status, data = _raw_request(rig.proxy_port, method, headers + [(name, v) for v in values])
+    err = _err(data)
+    assert (status, err["code"], err["data"]["reasonCode"], err["data"]["header"]) == (400, -32600, "claims_malformed_request", name), data
+    assert rig.fake.mcp_requests == []
+    assert [(x["event"], x["stage"], x["forwarded"], x["httpMethod"]) for x in rig.audit] == [("deny", "request", False, method)]
+
+
+# ---- raw header-block attacks (byte level) ------------------------------------
+
+
+def _send_raw(port: int, raw: bytes) -> tuple[int, bytes]:
+    """Write exactly ``raw`` to the proxy and parse the (close-delimited) response."""
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as s:
+        s.sendall(raw)
+        chunks = []
+        while data := s.recv(65536):
+            chunks.append(data)
+    resp = b"".join(chunks)
+    head, _, body = resp.partition(b"\r\n\r\n")
+    return int(head.split(b" ", 2)[1]), body
+
+
+def _raw_post_bytes(tok: str, lines: list[bytes], body: bytes, *, method: bytes = b"POST", auth: bool = True, length: bool = True) -> bytes:
+    head = [method + b" / HTTP/1.1", b"Host: 127.0.0.1", b"Content-Type: application/json", b"Accept: application/json, text/event-stream"]
+    if auth:
+        head.append(b"Authorization: Bearer " + tok.encode())
+    head += lines
+    if length:
+        head.append(b"Content-Length: " + str(len(body)).encode())
+    return b"\r\n".join(head) + b"\r\n\r\n" + body
+
+
+_BODY = json.dumps(CALL("get_block_number")).encode()
+
+# (case id, extra header lines, whether the bearer line is added, whether Content-Length is added, refused header)
+_REFUSED_RAW = [
+    ("obs-fold-carrying-authorization", [b"X-Probe: a", b" Authorization: Bearer {read}"], True, True, "X-Probe"),
+    ("obs-fold-carrying-session-id", [b"X-Probe: a", b"\tMcp-Session-Id: injected"], True, True, "X-Probe"),
+    ("whitespace-only-continuation-after-authorization", [b" "], True, True, "Authorization"),
+    ("fold-inside-authorization", None, False, True, "Authorization"),
+    ("bearer-with-c0-control", [b"Authorization: Bearer \x1c{tok}"], False, True, "Authorization"),
+    ("bearer-with-nul", [b"Authorization: Bearer {tok}\x00"], False, True, "Authorization"),
+    ("bearer-with-del", [b"Authorization: Bearer {tok}\x7f"], False, True, "Authorization"),
+    ("bearer-with-nbsp", [b"Authorization: Bearer \xa0{tok}"], False, True, "Authorization"),
+    ("bearer-with-nel", [b"Authorization: Bearer {tok}\x85"], False, True, "Authorization"),
+    ("control-in-other-header", [b"X-Trace: a\x01b"], True, True, "X-Trace"),
+    ("mcp-name-with-control", [b"Mcp-Name: get_block_number\x1f"], True, True, "Mcp-Name"),
+    ("whitespace-before-colon", [b"X-A : 1"], True, True, "header-block"),
+    ("leading-whitespace-first-line", None, True, True, "header-block"),
+    ("bare-cr-in-value", [b"X-A: a\rb"], True, True, "header-block"),
+    ("te-chunked-plus-content-length", [b"Transfer-Encoding: chunked"], True, True, "Transfer-Encoding"),
+    ("te-gzip-chunked-plus-content-length", [b"Transfer-Encoding: gzip, chunked"], True, True, "Transfer-Encoding"),
+    ("content-length-plus-sign", [b"Content-Length: +{n}"], True, False, "Content-Length"),
+    ("content-length-underscores", [b"Content-Length: {n_}"], True, False, "Content-Length"),
+    ("content-length-trailing-space", [b"Content-Length: {n} "], True, False, "Content-Length"),
+    ("content-length-trailing-tab", [b"Content-Length: {n}\t"], True, False, "Content-Length"),
+    ("content-length-negative-zero", [b"Content-Length: -0"], True, False, "Content-Length"),
+    ("content-length-hex", [b"Content-Length: 0x{nx}"], True, False, "Content-Length"),
+    ("connection-lists-authorization", [b"Connection: keep-alive, Authorization"], True, True, "Connection"),
+    ("connection-lists-mcp-method", [b"Connection: Mcp-Method", b"Mcp-Method: tools/call"], True, True, "Connection"),
+]
+
+
+def _refused_detail(case: str) -> str:
+    """The message fragment each case must be refused with (which check fired, not just that one did)."""
+    if case in ("bearer-with-nbsp", "bearer-with-nel"):
+        return "non-ASCII byte"
+    if case in ("whitespace-before-colon", "leading-whitespace-first-line", "bare-cr-in-value"):
+        return "malformed header line"
+    prefixes = {
+        "obs-fold": "obs-fold or CR/LF",
+        "whitespace-only": "obs-fold or CR/LF",
+        "fold-": "obs-fold or CR/LF",
+        "bearer-": "control character",
+        "control-": "control character",
+        "mcp-name-": "control character",
+        "te-": "both Transfer-Encoding and Content-Length",
+        "content-length-": "not plain ASCII digits",
+        "connection-lists-": "Connection lists the",
+    }
+    return next(v for k, v in prefixes.items() if case.startswith(k))
+
+
+def _build_raw(case: str, lines: list[bytes] | None, auth: bool, length: bool, tok: str, read: str) -> bytes:
+    n = len(_BODY)
+    fill = {b"{tok}": tok.encode(), b"{read}": read.encode(), b"{n}": str(n).encode(), b"{n_}": "_".join(str(n)).encode(), b"{nx}": f"{n:x}".encode()}
+
+    def sub(line: bytes) -> bytes:
+        for k, v in fill.items():
+            line = line.replace(k, v)
+        return line
+
+    if case == "fold-inside-authorization":
+        tok_b = tok.encode()
+        lines = [b"Authorization: Bearer " + tok_b[:20], b" " + tok_b[20:]]
+    if case == "leading-whitespace-first-line":
+        head = b"POST / HTTP/1.1\r\n X-Lead: 1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAuthorization: Bearer " + tok.encode() + b"\r\nContent-Length: " + str(n).encode() + b"\r\n\r\n"
+        return head + _BODY
+    return _raw_post_bytes(tok, [sub(x) for x in lines or []], _BODY, auth=auth, length=length)
+
+
+@pytest.mark.parametrize(("case", "lines", "auth", "length", "header"), _REFUSED_RAW, ids=[c[0] for c in _REFUSED_RAW])
+def test_hostile_header_blocks_are_refused_and_never_reach_upstream(rig_factory: Any, case: str, lines: list[bytes] | None, auth: bool, length: bool, header: str) -> None:
+    """obs-fold (RFC 9112 5.2), control characters, malformed lines, TE+CL, non-digit
+    Content-Length, and Connection naming an auth-relevant header: 400 before the token
+    is checked, audited as a deny, and not one byte reaches the upstream (raw TCP tap)."""
+    tap = RawTap()
+    rig = rig_factory(tap=tap)
+    tok, read = rig.token("kaia:read kaia:encode"), rig.token("kaia:read")
+    status, data = _send_raw(rig.proxy_port, _build_raw(case, lines, auth, length, tok, read))
+    err = _err(data)
+    assert (status, err["code"], err["data"]["reasonCode"], err["data"]["choice"]) == (400, -32600, "claims_malformed_request", "deny"), data
+    assert err["data"]["header"] == header, data
+    assert _refused_detail(case) in err["message"], err["message"]
+    assert rig.fake.mcp_requests == []
+    assert tap.raw() == [], tap.raw()
+    assert [(a["event"], a["stage"], a["forwarded"], a["header"]) for a in rig.audit] == [("deny", "request", False, header)]
+    assert not any(t in json.dumps(rig.audit) or t.encode() in data for t in (tok, read))
+
+
+def test_connection_listed_and_proxy_connection_headers_are_not_forwarded(rig_factory: Any) -> None:
+    """RFC 9110 7.6.1: headers named in Connection are hop-by-hop, as is Proxy-Connection."""
+    tap = RawTap()
+    rig = rig_factory(tap=tap)
+    tok = rig.token("kaia:read")
+    lines = [b"Connection: keep-alive, X-Nominated", b"Connection: x-other", b"X-Nominated: hop-secret", b"X-Other: hop-2", b"Proxy-Connection: keep-alive", b"Keep-Alive: timeout=5", b"X-Kept: end-to-end", b"Mcp-Method: tools/call", b"Mcp-Name: get_block_number"]
+    status, data = _send_raw(rig.proxy_port, _raw_post_bytes(tok, lines, _BODY))
+    assert status == 200, data
+    [seen] = rig.fake.mcp_requests
+    names = {k.lower() for k in seen["headers"]}
+    assert not names & {"x-nominated", "x-other", "proxy-connection", "keep-alive"}, names
+    assert seen["headers"]["X-Kept"] == "end-to-end"
+    [raw] = tap.raw()
+    head = raw.split(b"\r\n\r\n", 1)[0].lower()
+    for gone in (b"x-nominated", b"hop-secret", b"x-other", b"proxy-connection", b"keep-alive"):
+        assert gone not in head, raw
+    # Mcp-Method/Mcp-Name are relayed as sent (never trusted: the body decides).
+    assert b"\r\nmcp-method: tools/call\r\n" in head and b"\r\nmcp-name: get_block_number\r\n" in head
+    assert raw.count(b"Authorization: Bearer " + tok.encode() + b"\r\n") == 1 and head.count(b"\r\nauthorization:") == 1
+    assert raw.endswith(b"\r\n\r\n" + _BODY)
+
+
+def test_connection_listed_headers_are_dropped_from_upstream_responses(rig_factory: Any) -> None:
+    fake = FakeKaia(signer=TestSigner.generate(kid="kid-1"))
+    fake.canned = (200, [("Content-Type", "application/json"), ("Connection", "X-Hop"), ("X-Hop", "upstream-hop"), ("Proxy-Connection", "keep-alive"), ("X-End", "kept")], b'{"jsonrpc":"2.0","id":1,"result":{}}')
+    rig = rig_factory(fake=fake)
+    status, headers, _ = rig.post(CALL("get_block_number"), rig.token("kaia:read"))
+    assert status == 200
+    assert "x-hop" not in headers and "proxy-connection" not in headers and headers["x-end"] == "kept"
+
+
+def test_valid_content_length_forms_are_accepted(rig_factory: Any) -> None:
+    """Plain digits (leading zeros allowed by RFC 9110's 1*DIGIT; leading OWS is stripped by the parser)."""
+    rig = rig_factory()
+    tok = rig.token("kaia:read")
+    for cl in (str(len(_BODY)).encode(), b"00" + str(len(_BODY)).encode()):
+        status, data = _send_raw(rig.proxy_port, _raw_post_bytes(tok, [b"Content-Length:   " + cl], _BODY, length=False))
+        assert status == 200, data
+    assert [r["body"] for r in rig.fake.mcp_requests] == [_BODY, _BODY]
+
+
+def test_htab_and_obs_text_in_other_headers_are_still_forwarded(rig_factory: Any) -> None:
+    """Only control characters are refused everywhere; HTAB is legal, and obs-text is refused only in auth-relevant headers."""
+    rig = rig_factory()
+    tok = rig.token("kaia:read")
+    status, data = _send_raw(rig.proxy_port, _raw_post_bytes(tok, [b"User-Agent: a\tb", b"X-Note: caf\xe9"], _BODY))
+    assert status == 200, data
+    [seen] = rig.fake.mcp_requests
+    assert (seen["headers"]["User-Agent"], seen["headers"]["X-Note"]) == ("a\tb", "caf\xe9")
+
+
+def test_transfer_encoding_alone_is_never_forwarded(rig_factory: Any) -> None:
+    """TE without Content-Length: the proxy never decodes chunked, never forwards TE, and the
+    empty body is not JSON-RPC, so the request ends in 400 after the token check."""
+    tap = RawTap()
+    rig = rig_factory(tap=tap)
+    tok = rig.token("kaia:read")
+    chunked = f"{len(_BODY):x}\r\n".encode() + _BODY + b"\r\n0\r\n\r\n"
+    status, data = _send_raw(rig.proxy_port, _raw_post_bytes(tok, [b"Transfer-Encoding: chunked"], chunked, length=False))
+    assert (status, _err(data)["data"]["reasonCode"]) == (400, "claims_malformed_request"), data
+    assert tap.raw() == [] and rig.fake.mcp_requests == []
