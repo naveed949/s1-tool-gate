@@ -5,7 +5,7 @@ This directory is the maintained source for verifying the user-facing behavior o
 ## Baseline preconditions
 
 - Launch with `.cursor/skills/verify-s1-tool-gate/helpers/launch.sh` so the run has its own TEST-ONLY key and `jwks.json` under `/tmp/s1-verify-<run-id>/kit`.
-- `doctor.sh` must exit 0. It checks that `claims_gate` is imported from this checkout, and that the fixture is kaia-mcp `db76732` with 26 tools and wallet tool `generate_wallet`.
+- `doctor.sh` must exit 0. It checks that `claims_gate` is imported from this checkout, and that the fixture is kaia-mcp `253d6c8` with 26 tools and wallet tool `generate_wallet`.
 - Trust anchors for every `decide` call:
   - issuer `https://idp.test.invalid`
   - audience `kaia-mcp`
@@ -17,6 +17,7 @@ This directory is the maintained source for verifying the user-facing behavior o
 - Commands are literal. Keep tool names, scope strings, and reason codes unchanged.
 - Pass tokens through `S1_AUTHORIZATION`, never on argv.
 - Every feature starts from the baseline. No feature mutates shared state, and every token is minted fresh.
+- `live-proxy` is the only feature that starts processes and uses the network. It starts and stops its own kaia-mcp and proxies inside one drive. Its tokens come from kaia-mcp's demo IdP, not the TEST-ONLY kit.
 
 ## Proof and skip reporting
 
@@ -40,3 +41,4 @@ Each feature file starts with an H1 and one paragraph. Then come exactly four H2
 - [Token validation](./token-validation.md): missing, malformed, expired, wrong-audience, wrong-issuer, forged, and missing-claim tokens fail closed.
 - [Wallet escalation](./wallet-escalation.md): `generate_wallet` escalates (or denies) and is never allowed.
 - [kaia enforcement demo](./kaia-enforcement-demo.md): the 22 golden cases run through the gate and the enforcement seam, and the stub runs only on allow.
+- [Live proxy](./live-proxy.md): `python -m claims_gate proxy` in front of a real, running kaia-mcp. Allowed reads return chain data. Denies and wallet escalations never reach kaia-mcp. Forged, wrong-audience, expired, and revoked tokens are refused, and the proxy will not start on tool-scope drift.

@@ -21,3 +21,8 @@ class ClaimsReason(StrEnum):
     INSUFFICIENT_SCOPE = "claims_insufficient_scope"
     WALLET_ESCALATE = "claims_wallet_escalate"
     WALLET_DENIED = "claims_wallet_denied"
+    # Live proxy only (claims_gate.proxy).
+    JWKS_UNAVAILABLE = "claims_jwks_unavailable"
+    TOKEN_REVOKED = "claims_token_revoked"
+    INTROSPECTION_UNAVAILABLE = "claims_introspection_unavailable"
+    MALFORMED_REQUEST = "claims_malformed_request"

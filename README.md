@@ -34,7 +34,7 @@ The log schema is [packages/gate-enforcement/observation-log.schema.json](packag
 
 ## Claims gate (OIDC/OAuth in front of an MCP server)
 
-`packages/claims-gate` turns a verified access token into an allow / deny / escalate for one MCP tool call. It checks the signature against a JWKS, then `iss`, `aud`, `exp`/`nbf`, `sub`, and `scope`. The scopes map onto a tool policy. It returns the same `GateDecision` shape as the gate client, so `gate-enforcement` runs it unchanged. It ships a kaia-mcp fixture (`kaia:read`, `kaia:encode`, `kaia:wallet`, copied from kaia-mcp `db76732`) and 22 golden evals. Details are in [packages/claims-gate/README.md](packages/claims-gate/README.md).
+`packages/claims-gate` turns a verified access token into an allow / deny / escalate for one MCP tool call. It checks the signature against a JWKS, then `iss`, `aud`, `exp`/`nbf`, `sub`, and `scope`. The scopes map onto a tool policy. It returns the same `GateDecision` shape as the gate client, so `gate-enforcement` runs it unchanged. It ships a kaia-mcp fixture (`kaia:read`, `kaia:encode`, `kaia:wallet`, copied from kaia-mcp `253d6c8`) and 22 golden evals. `python -m claims_gate proxy` runs the same gate as a live reverse proxy in front of a running kaia-mcp. It verifies kaia's JWTs via JWKS and optional introspection, never forwards denies or wallet escalations, and refuses to start on tool-scope drift. `packages/claims-gate/e2e/live_kaia.py` proves this end to end. Details are in [packages/claims-gate/README.md](packages/claims-gate/README.md).
 
 ### Wiring it in front of an MCP server
 
@@ -89,7 +89,7 @@ The report schema, the binning definition, and the commands are in [packages/aut
 - `packages/gate-client` is the Python System-1 gate client (`typesafe-sdk` against local Ollama Nimble).
 - `packages/gate-enforcement` is the Python enforcement seam, stub tool runner, and observation log.
 - `packages/e2e-demo` is the scripted demo that calls the three packages and writes one report.
-- `packages/claims-gate` is the Python OIDC/OAuth claims gate: verified token claims to allow / deny / escalate, with the kaia-mcp fixture and golden evals.
+- `packages/claims-gate` is the Python OIDC/OAuth claims gate: verified token claims to allow / deny / escalate, with the kaia-mcp fixture, golden evals, a live reverse proxy (`python -m claims_gate proxy`), and a live kaia-mcp e2e (`e2e/live_kaia.py`).
 
 The flip harness does not call the gate client or the enforcement seam. `packages/e2e-demo` is the scripted path that calls all three and prints one report.
 

@@ -1,5 +1,5 @@
 {
-  "source": "naveed949/kaia-mcp@db76732:src/auth/scopes.ts",
+  "source": "naveed949/kaia-mcp@253d6c8:src/auth/scopes.ts",
   "issuer": "https://idp.test.invalid",
   "audience": "kaia-mcp",
   "now": 1800000000,

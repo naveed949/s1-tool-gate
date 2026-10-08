@@ -21,14 +21,21 @@ LOC="$("${PY}" -c 'import claims_gate, gate_enforcement, os; print(os.path.dirna
 "${PY}" -m claims_gate tools | "${PY}" -c '
 import json, sys
 t = json.load(sys.stdin)
-assert t["source"].endswith("db76732:src/auth/scopes.ts"), t["source"]
+assert t["source"].endswith("253d6c8:src/auth/scopes.ts"), t["source"]
 assert len(t["toolScopes"]) == 26, len(t["toolScopes"])
 assert t["walletTools"] == ["generate_wallet"], t["walletTools"]
 ' || fail "kaia fixture mismatch"
+
+"${PY}" -m claims_gate proxy --help > /dev/null || fail "claims_gate has no proxy subcommand"
+# live-proxy prerequisites (only that feature needs them; report, do not fail the others).
+LIVE="node=$(command -v node >/dev/null && node -v || echo missing) npm=$(command -v npm >/dev/null && npm -v || echo missing) git=$(command -v git >/dev/null && echo ok || echo missing)"
+PINNED="$(sed -n 's/^DEFAULT_KAIA_REF = "\([0-9a-f]*\)"/\1/p' packages/claims-gate/e2e/live_kaia.py | cut -c1-7)"
+KAIA_SRC="${S1_VERIFY_KAIA_DIR:-${KAIA_MCP_DIR:-pinned-clone@${PINNED}}}"
 
 echo "doctor: healthy"
 echo "  run=${RUN_ID}"
 echo "  python=${PY}"
 echo "  claims_gate=${LOC}"
 echo "  jwks=${KIT_DIR}/jwks.json kid=$("${PY}" -c "import json;print(json.load(open('${KIT_DIR}/jwks.json'))['keys'][0]['kid'])")"
-echo "  fixture=kaia-mcp@db76732 tools=26 wallet=generate_wallet"
+echo "  fixture=kaia-mcp@253d6c8 tools=26 wallet=generate_wallet"
+echo "  live-proxy: ${LIVE} kaia=${KAIA_SRC}"

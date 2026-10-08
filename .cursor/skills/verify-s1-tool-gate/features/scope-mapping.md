@@ -34,4 +34,4 @@ Preconditions:
 
 - `decide` exits 0 for any decision, including deny. Assert on `choice` and `reasonCode`, not on the exit code.
 - A scope check is exact string membership. `kaia:read` does not imply `kaia:encode`.
-- The fixture is copied from kaia-mcp `db76732`. A tool added to kaia-mcp later denies as unknown until the fixture is updated.
+- The fixture is copied from kaia-mcp `253d6c8`. A tool added to kaia-mcp later denies as unknown until the fixture is updated.

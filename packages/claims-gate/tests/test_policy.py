@@ -34,7 +34,7 @@ def _claims(scopes: set[str]) -> VerifiedClaims:
     return VerifiedClaims("s", TEST_ISSUER, (TEST_AUDIENCE,), frozenset(scopes), NOW + 60)
 
 
-def test_kaia_fixture_matches_kaia_mcp_db76732() -> None:
+def test_kaia_fixture_matches_kaia_mcp_253d6c8() -> None:
     assert len(KAIA_READ_TOOLS) == 24
     assert len(KAIA_TOOL_SCOPES) == 26
     assert KAIA_TOOL_SCOPES["encode_function_data"] == "kaia:encode"
