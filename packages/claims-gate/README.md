@@ -116,7 +116,7 @@ python -m claims_gate proxy --upstream http://127.0.0.1:3100 \
 
 Without `--escalation-dir` (or `S1_ESCALATION_DIR`) an escalation is terminal: `-32051` with a random `escalationId` and `escalationStatus: "not_queued"`, and nothing can approve it.
 
-With it, the proxy records every escalation in `<dir>/escalations.sqlite3` (dir mode `700`, file `600`). One row per request:
+With it, the proxy records every escalation in `<dir>/escalations.sqlite3` (dir mode `700`, file `600`). If the file (or the directory) is deleted while the proxy runs, the next queue access recreates it empty with the same modes, whatever the process umask; nothing approved survives, so the next escalation is a fresh `pending` request. One row per request:
 
 | Field | Meaning |
 | --- | --- |

@@ -141,24 +141,44 @@ class EscalationStore:
         self.pending_ttl = float(pending_ttl)
         self.approval_ttl = float(approval_ttl)
         self._clock = clock
-        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._create_private()
         os.chmod(self.directory, 0o700)
-        if not self.path.exists():
-            fd = os.open(self.path, os.O_CREAT | os.O_WRONLY, 0o600)
-            os.close(fd)
         os.chmod(self.path, 0o600)
-        with self._tx() as db:
-            for stmt in _SCHEMA.split(";"):
-                if stmt.strip():
-                    db.execute(stmt)
+        with self._tx(schema=True):
+            pass
 
     # ---- plumbing --------------------------------------------------------
+    def _create_private(self) -> bool:
+        """Create the dir (700) and db file (600) if missing, before sqlite can create them.
+
+        sqlite would otherwise create a deleted db with the process umask (often 644).
+        Returns True if the db file was missing.
+        """
+        if self.path.exists():
+            return False
+        if not self.directory.is_dir():
+            self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(self.directory, 0o700)
+        fd = os.open(self.path, os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+        return True
+
     @contextmanager
-    def _tx(self) -> Iterator[sqlite3.Connection]:
+    def _tx(self, *, schema: bool = False) -> Iterator[sqlite3.Connection]:
+        # A db deleted at runtime is recreated private and empty (fail closed: no
+        # approval survives; the next escalation is a fresh pending request).
+        schema = self._create_private() or schema
         db = sqlite3.connect(self.path, timeout=5.0, isolation_level=None)
         try:
             db.execute("BEGIN IMMEDIATE")
             try:
+                if schema:
+                    for stmt in _SCHEMA.split(";"):
+                        if stmt.strip():
+                            db.execute(stmt)
                 yield db
             except BaseException:
                 db.execute("ROLLBACK")

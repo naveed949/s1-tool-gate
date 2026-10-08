@@ -302,3 +302,26 @@ def test_args_hash_is_over_exact_args_without_normalization() -> None:
     assert args_hash({"label": nfc}) != args_hash({"label": nfd})
     assert args_hash({"n": 1}) != args_hash({"n": 1.0})
     assert args_hash({"label": "A"}) != args_hash({"label": "a"})
+
+
+@pytest.mark.parametrize("remove", ["file", "dir"])
+def test_db_deleted_at_runtime_is_recreated_private(tmp_path: Path, remove: str) -> None:
+    import os
+    import shutil
+
+    clock = Clock()
+    s = store(tmp_path, clock)
+    s.on_escalate("alice", "generate_wallet", H, "r")
+    if remove == "file":
+        s.path.unlink()
+    else:
+        shutil.rmtree(s.directory)
+    old = os.umask(0o022)  # a permissive umask must not leak into the recreated db
+    try:
+        out = s.on_escalate("alice", "generate_wallet", H, "r")
+    finally:
+        os.umask(old)
+    assert out.action == "escalate" and out.escalation.status == "pending"  # fresh queue: nothing approved survives
+    assert stat.S_IMODE(s.path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(s.directory.stat().st_mode) == 0o700
+    assert [e.id for e in s.list()] == [out.escalation.id]
