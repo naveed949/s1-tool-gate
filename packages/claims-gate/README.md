@@ -33,6 +33,7 @@ The live proxy (below) adds deny codes of its own:
 | JSON-RPC batch, unparseable body, or `tools/call` without `params.name` | deny | `claims_malformed_request` |
 | Escalated call whose identical request a human denied (within the deny window) | deny | `claims_escalation_denied` |
 | Escalated call, but the escalation queue cannot be read or written | deny | `claims_escalation_unavailable` |
+| `tools/call` while the periodic recheck finds the upstream tool-scope map different or unfetchable | deny | `claims_tool_scope_drift` |
 
 `probs` is always `{}`. This is a rule, not a model score. `ToolPolicy` refuses `wallet_default="allow"`.
 
@@ -46,7 +47,13 @@ The live proxy (below) adds deny codes of its own:
 
 The fixture is copied by hand. A tool kaia-mcp adds later is denied (`claims_unknown_tool`) until it is added here.
 
-**Drift guard.** The gate keeps owning its map; it does not take policy from the server it guards. Instead, the live proxy fetches kaia-mcp's published map (`GET /.well-known/kaia-mcp/tool-scopes`, added in naveed949/kaia-mcp#3) at startup and **refuses to start** if any tool or scope differs, or if the map cannot be fetched. `--no-drift-check` turns this off for upstreams that do not publish the map.
+**Drift guard.** The gate keeps owning its map. It does not take policy from the server it guards. Instead, the live proxy fetches kaia-mcp's published map (`GET /.well-known/kaia-mcp/tool-scopes`, added in naveed949/kaia-mcp#3) and compares it with its own:
+
+- At startup, the proxy **refuses to start** (exit 3) if any tool or scope differs, or if the map cannot be fetched.
+- While serving, it rechecks every `--drift-interval` seconds (default 60). If the maps differ, or the fetch fails, it **fails closed**: every `tools/call` is denied with `-32050` `claims_tool_scope_drift`, and `error.data.drift` carries the diff or the fetch error. This lasts until a recheck matches again. Other MCP traffic (`initialize`, `tools/list`, …) still needs only a valid token.
+  - Each transition (`ok -> drift`, `drift -> ok`) is logged at WARNING and written to the audit log as `drift_failing` / `drift_recovered`.
+  - `GET /health` reports `toolScopes: {ok, checkedAt, intervalSeconds, url}`.
+- `--drift-interval 0` keeps only the startup check. `--no-drift-check` turns off both checks, for upstreams that do not publish the map.
 
 ## Golden evals
 
@@ -98,7 +105,7 @@ python -m claims_gate proxy --upstream http://127.0.0.1:3100 \
 - JSON-RPC **batches are rejected** (`claims_malformed_request`), so a batch cannot hide a `tools/call`.
 - **No token is logged.** Each decision is one log line and, with `--audit-log`, one JSON line with `event`, `reasonCode`, `tool`, `subject`, `forwarded`, and a 12-char token fingerprint.
 - `GET /health` and `GET /.well-known/oauth-protected-resource` are served by the proxy itself. The latter points `authorization_servers` at the issuer.
-- **Startup is fail-closed.** Discovery, JWKS, introspection credentials, and the drift check must all pass, or the proxy prints the reason and exits 3 without listening.
+- **Startup is fail-closed.** Discovery, JWKS, introspection credentials, the escalation queue (if configured), and the drift check must all pass. Otherwise the proxy prints the reason and exits 3 without listening. After startup, the drift check keeps running (see **Drift guard** above).
 
 ### Escalation queue
 

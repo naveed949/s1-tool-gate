@@ -28,3 +28,4 @@ class ClaimsReason(StrEnum):
     MALFORMED_REQUEST = "claims_malformed_request"
     ESCALATION_DENIED = "claims_escalation_denied"
     ESCALATION_UNAVAILABLE = "claims_escalation_unavailable"
+    TOOL_SCOPE_DRIFT = "claims_tool_scope_drift"

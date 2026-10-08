@@ -26,7 +26,10 @@ The proxy never logs or echoes a token. Logs and the audit file carry a
 At startup the proxy compares its own kaia tool -> scope map with the one the
 upstream publishes at ``/.well-known/kaia-mcp/tool-scopes`` and refuses to
 start on any difference or if the map cannot be fetched (unless the drift
-check is explicitly turned off).
+check is explicitly turned off). While running, ``DriftMonitor`` rechecks the
+map every ``drift_interval`` seconds; on drift or a failed fetch every
+``tools/call`` is denied (``claims_tool_scope_drift``) until the maps match
+again. State transitions are logged and audited.
 """
 
 from __future__ import annotations
@@ -256,6 +259,85 @@ def check_tool_scope_drift(
     }
 
 
+class DriftMonitor:
+    """Periodic tool-scope drift recheck. Closed (``ok`` False) until a check passes, and on any failure."""
+
+    def __init__(
+        self,
+        url: str,
+        expected: Mapping[str, str],
+        *,
+        interval: float = 60.0,
+        fetch: JsonFetcher = http_json,
+        audit: Callable[[dict[str, Any]], None] | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        if interval <= 0:
+            raise ValueError("drift interval must be positive")
+        self.url = url
+        self.expected = dict(expected)
+        self.interval = float(interval)
+        self._fetch = fetch
+        self._audit = audit
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._ok: bool | None = None  # None = never checked (treated as closed)
+        self._report: dict[str, Any] = {"ok": False, "url": url, "error": "not checked yet"}
+        self._checked_at: float | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self._ok is True
+
+    @property
+    def report(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._report)
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return {"ok": self._ok is True, "checkedAt": self._checked_at, "intervalSeconds": self.interval, "url": self.url}
+
+    def record(self, report: dict[str, Any]) -> dict[str, Any]:
+        """Store a check result and log/audit a state transition."""
+        ok = report.get("ok") is True
+        with self._lock:
+            prev = self._ok
+            self._ok, self._report, self._checked_at = ok, dict(report), self._clock()
+        if prev is not None and prev != ok:
+            if ok:
+                LOG.warning("tool-scope map drift -> ok: tools/call allowed again (%s)", self.url)
+            else:
+                summary = {k: report[k] for k in ("error", "missingFromGate", "notUpstream", "scopeChanged") if report.get(k)}
+                LOG.warning("tool-scope map ok -> drift: denying every tools/call until the maps match (%s) %s", self.url, json.dumps(summary, sort_keys=True))
+            if self._audit is not None:
+                self._audit({"ts": time.time(), "event": "drift_recovered" if ok else "drift_failing", "stage": "drift", "drift": report})
+        return report
+
+    def check_once(self) -> dict[str, Any]:
+        try:
+            report = check_tool_scope_drift(self.url, self.expected, fetch=self._fetch)
+        except Exception as err:  # noqa: BLE001 - any failure closes the gate
+            report = {"ok": False, "url": self.url, "error": f"{type(err).__name__}"}
+        return self.record(report)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            self.check_once()
+
+    def start(self) -> None:
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, name="claims-gate-drift", daemon=True)
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+
 @dataclass
 class ProxyConfig:
     upstream: str
@@ -269,6 +351,7 @@ class ProxyConfig:
     audit: Callable[[dict[str, Any]], None] | None = None
     algorithms: tuple[str, ...] = ("RS256", "ES256")
     escalations: Any = None  # claims_gate.escalations.EscalationStore, or None (escalations are terminal)
+    drift: DriftMonitor | None = None  # None: startup check only (or drift check off)
 
 
 @dataclass(frozen=True)
@@ -376,7 +459,8 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if path == "/health" and self.config.mcp_path != "/health":
-            self._send(200, json.dumps({"status": "ok", "server": "s1-tool-gate-proxy", "issuer": self.config.issuer, "audience": self.config.audience, "introspection": self.config.introspector is not None}).encode())
+            tool_scopes = self.config.drift.status() if self.config.drift is not None else {"periodic": False}
+            self._send(200, json.dumps({"status": "ok", "server": "s1-tool-gate-proxy", "issuer": self.config.issuer, "audience": self.config.audience, "introspection": self.config.introspector is not None, "toolScopes": tool_scopes}).encode())
             return
         if path == "/.well-known/oauth-protected-resource":
             self._send(200, json.dumps({"resource": self._base_url() + self.config.mcp_path, "authorization_servers": [self.config.issuer], "bearer_methods_supported": ["header"], "resource_name": "kaia-mcp via s1-tool-gate"}).encode())
@@ -431,6 +515,13 @@ class _Handler(BaseHTTPRequestHandler):
                     reason = ClaimsReason.MALFORMED_REQUEST.value
                     self._record(event="deny", stage="request", reasonCode=reason, rpcMethod=rpc_method, tokenFp=check.fp, forwarded=False)
                     self._send(200, _jsonrpc_error(rpc_id, INVALID_REQUEST_CODE, "s1-tool-gate: tools/call without params.name", {"reasonCode": reason, "choice": "deny"}))
+                    return
+                drift = self.config.drift
+                if drift is not None and not drift.ok:
+                    reason = ClaimsReason.TOOL_SCOPE_DRIFT.value
+                    report = drift.report
+                    self._record(event="deny", stage="drift", reasonCode=reason, choice="deny", rpcMethod=rpc_method, tool=tool, subject=check.claims.subject, tokenFp=check.fp, forwarded=False)
+                    self._send(200, _jsonrpc_error(rpc_id, DENY_CODE, f"s1-tool-gate denied {tool}: {reason} (upstream tool-scope map differs or is unavailable; failing closed)", {"reasonCode": reason, "choice": "deny", "tool": tool, "drift": report}))
                     return
                 decision = self.config.policy.decide(check.claims, tool)
                 base = {
@@ -574,6 +665,7 @@ def build_config(
     introspection_client_secret: str | None = None,
     tool_scopes_url: str | None = None,
     drift_check: bool = True,
+    drift_interval: float = 60.0,
     jwks_ttl_seconds: float = 300.0,
     mcp_path: str = "/",
     audit: Callable[[dict[str, Any]], None] | None = None,
@@ -616,10 +708,15 @@ def build_config(
             introspector = Introspector(introspection_url, introspection_client_id, introspection_client_secret, fetch=fetch)
 
     drift = None
+    monitor = None
     if drift_check:
-        drift = check_tool_scope_drift(tool_scopes_url or upstream.rstrip("/") + TOOL_SCOPES_PATH, policy.tool_scopes, fetch=fetch)
+        scopes_url = tool_scopes_url or upstream.rstrip("/") + TOOL_SCOPES_PATH
+        drift = check_tool_scope_drift(scopes_url, policy.tool_scopes, fetch=fetch)
         if not drift["ok"]:
             errors.append("tool-scope drift check failed")
+        elif drift_interval > 0:
+            monitor = DriftMonitor(scopes_url, policy.tool_scopes, interval=drift_interval, fetch=fetch, audit=audit)
+            monitor.record(drift)
 
     cache = JwksCache(resolved_jwks or "", ttl_seconds=jwks_ttl_seconds, fetch=fetch)
     if resolved_jwks and not errors:
@@ -642,6 +739,7 @@ def build_config(
             mcp_path=mcp_path,
             audit=audit,
             escalations=escalations,
+            drift=monitor,
         ),
         report,
     )

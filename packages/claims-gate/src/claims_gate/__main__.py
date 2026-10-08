@@ -10,6 +10,7 @@
   [S1_INTROSPECTION_CLIENT_ID=... S1_INTROSPECTION_CLIENT_SECRET=...] \
   python -m claims_gate proxy --upstream URL --issuer ISS --audience AUD [--port N]
       [--introspection auto|URL] [--jwks-uri URL] [--tool-scopes-url URL | --no-drift-check]
+      [--drift-interval SECONDS]
       [--audit-log FILE] [--wallet-default escalate|deny]
       [--escalation-dir DIR [--escalation-pending-ttl S] [--escalation-approval-ttl S]]
   python -m claims_gate escalations list [--status STATUS] [--dir DIR]
@@ -22,6 +23,9 @@ decision JSON and exits 0 for any decision; exit 2 is a usage/config error.
 ``proxy`` prints its startup report as JSON, then ``ready: ...``, and serves
 until interrupted. It exits 3 without listening if discovery, the JWKS, the
 introspection setup, or the tool-scope drift check fails (fail closed).
+While serving it rechecks the tool-scope map every ``--drift-interval``
+seconds (default 60; 0 = startup only) and denies every ``tools/call`` while
+the maps differ or the map cannot be fetched.
 Introspection credentials come from the environment, never argv.
 ``escalations`` reads the queue in ``--dir`` (default ``$S1_ESCALATION_DIR``),
 prints JSON, and exits 0; 1 if the approve/deny is not allowed from the
@@ -162,6 +166,7 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
         introspection_client_secret=os.environ.get("S1_INTROSPECTION_CLIENT_SECRET") or None,
         tool_scopes_url=args.tool_scopes_url,
         drift_check=not args.no_drift_check,
+        drift_interval=args.drift_interval,
         jwks_ttl_seconds=args.jwks_ttl,
         mcp_path=args.mcp_path,
         audit=audit,
@@ -173,12 +178,16 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
         return 3
     server = make_server(config, args.host, args.port)
     host, port = server.server_address[:2]
+    if config.drift is not None:
+        config.drift.start()
     print(f"ready: s1-tool-gate proxy on http://{host}:{port}{args.mcp_path} -> {args.upstream}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if config.drift is not None:
+            config.drift.stop()
         server.server_close()
     return 0
 
@@ -221,7 +230,8 @@ def main(argv: list[str] | None = None) -> int:
     p_proxy.add_argument("--jwks-ttl", type=float, default=300.0)
     p_proxy.add_argument("--introspection", help="'auto' (discovery) or an RFC 7662 URL; credentials from S1_INTROSPECTION_CLIENT_ID/SECRET")
     p_proxy.add_argument("--tool-scopes-url", help="default: <upstream>/.well-known/kaia-mcp/tool-scopes")
-    p_proxy.add_argument("--no-drift-check", action="store_true", help="skip the startup tool-scope drift check (not recommended)")
+    p_proxy.add_argument("--no-drift-check", action="store_true", help="skip the tool-scope drift check entirely (not recommended)")
+    p_proxy.add_argument("--drift-interval", type=float, default=60.0, help="seconds between tool-scope map rechecks while serving; drift or fetch failure denies every tools/call until fixed (0 = startup check only)")
     p_proxy.add_argument("--host", default="127.0.0.1")
     p_proxy.add_argument("--port", type=int, default=0)
     p_proxy.add_argument("--mcp-path", default="/")

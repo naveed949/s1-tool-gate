@@ -23,6 +23,7 @@ from claims_gate.kaia import KAIA_TOOL_SCOPES, kaia_policy
 from claims_gate.proxy import (
     DENY_CODE,
     ESCALATE_CODE,
+    DriftMonitor,
     JwksCache,
     UpstreamError,
     build_config,
@@ -40,6 +41,7 @@ class FakeKaia:
     issuer: str = ""
     revoked: set[str] = field(default_factory=set)
     introspection_status: int = 200
+    tool_scopes_status: int = 200
     tool_scopes: dict[str, str] = field(default_factory=lambda: dict(KAIA_TOOL_SCOPES))
     mcp_requests: list[dict[str, Any]] = field(default_factory=list)
     jwks_fetches: int = 0
@@ -70,7 +72,7 @@ def _fake_handler(state: FakeKaia) -> type[BaseHTTPRequestHandler]:
                 state.jwks_fetches += 1
                 self._json(200, state.signer.jwks())
             elif self.path == "/.well-known/kaia-mcp/tool-scopes":
-                self._json(200, {"resource": "kaia-mcp", "tool_scopes": state.tool_scopes})
+                self._json(state.tool_scopes_status, {"resource": "kaia-mcp", "tool_scopes": state.tool_scopes})
             else:
                 self._mcp(b"")
 
@@ -487,3 +489,105 @@ def test_escalation_without_a_queue_is_terminal(rig_factory: Any) -> None:
     rig = rig_factory()
     err = _err(rig.post(CALL("generate_wallet"), rig.token("kaia:wallet"))[2])
     assert err["code"] == ESCALATE_CODE and err["data"]["escalationStatus"] == "not_queued" and err["data"]["escalationId"]
+
+
+# ---- periodic tool-scope drift recheck ---------------------------------------
+
+
+def _health(rig: Rig) -> dict[str, Any]:
+    conn = http.client.HTTPConnection("127.0.0.1", rig.proxy_port, timeout=10)
+    conn.request("GET", "/health")
+    data = json.loads(conn.getresponse().read())
+    conn.close()
+    return data
+
+
+def test_drift_at_runtime_fails_closed_then_recovers(rig_factory: Any, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="claims_gate.proxy")
+    rig = rig_factory(drift_interval=3600)
+    monitor = rig.config.drift
+    assert isinstance(monitor, DriftMonitor) and monitor.ok
+    tok = rig.token("kaia:read")
+    assert rig.post(CALL("get_block_number"), tok)[0] == 200
+    assert len(rig.fake.mcp_requests) == 1
+
+    rig.fake.tool_scopes["get_block_number"] = "kaia:encode"
+    assert monitor.check_once()["ok"] is False
+    status, _, data = rig.post(CALL("get_block_number", 2), tok)
+    err = _err(data)
+    assert (status, err["code"], err["data"]["reasonCode"]) == (200, DENY_CODE, "claims_tool_scope_drift")
+    assert err["data"]["drift"]["scopeChanged"] == {"get_block_number": {"gate": "kaia:read", "upstream": "kaia:encode"}}
+    assert len(rig.fake.mcp_requests) == 1  # not forwarded
+    assert rig.audit[-1]["event"] == "deny" and rig.audit[-1]["stage"] == "drift"
+    assert _health(rig)["toolScopes"]["ok"] is False
+    # other MCP traffic still needs only a valid token
+    assert rig.post({"jsonrpc": "2.0", "id": 9, "method": "tools/list"}, tok)[0] == 200
+
+    rig.fake.tool_scopes["get_block_number"] = "kaia:read"
+    assert monitor.check_once()["ok"] is True
+    assert rig.post(CALL("get_block_number", 3), tok)[0] == 200
+    assert json.loads(rig.fake.mcp_requests[-1]["body"])["id"] == 3
+    assert _health(rig)["toolScopes"]["ok"] is True
+    transitions = [r.getMessage() for r in caplog.records if "tool-scope map" in r.getMessage()]
+    assert len(transitions) == 2
+    assert "ok -> drift" in transitions[0] and "drift -> ok" in transitions[1]
+    assert [a["event"] for a in rig.audit if a["event"].startswith("drift_")] == ["drift_failing", "drift_recovered"]
+
+
+def test_tool_scope_map_fetch_failure_fails_closed(rig_factory: Any) -> None:
+    rig = rig_factory(drift_interval=3600)
+    tok = rig.token("kaia:read")
+    rig.fake.tool_scopes_status = 503
+    report = rig.config.drift.check_once()
+    assert report["ok"] is False and "503" in report["error"]
+    err = _err(rig.post(CALL("get_block_number"), tok)[2])
+    assert err["data"]["reasonCode"] == "claims_tool_scope_drift" and "503" in err["data"]["drift"]["error"]
+    rig.config.drift.check_once()  # still failing: no second transition
+    assert [a["event"] for a in rig.audit if a["event"].startswith("drift_")] == ["drift_failing"]
+    rig.fake.tool_scopes_status = 200
+    rig.config.drift.check_once()
+    assert rig.post(CALL("get_block_number"), tok)[0] == 200
+    assert len(rig.fake.mcp_requests) == 1
+
+
+def test_drift_monitor_rechecks_on_its_interval() -> None:
+    served = [dict(KAIA_TOOL_SCOPES)]
+    calls = {"n": 0}
+
+    def fetch(url: str, **_: Any) -> tuple[int, Any]:
+        calls["n"] += 1
+        return 200, {"tool_scopes": served[0]}
+
+    monitor = DriftMonitor("u", KAIA_TOOL_SCOPES, interval=0.05, fetch=fetch)
+    assert monitor.check_once()["ok"] and monitor.ok
+    monitor.start()
+    try:
+        served[0] = {"get_block": "kaia:read"}
+        deadline = time.time() + 5
+        while monitor.ok and time.time() < deadline:
+            time.sleep(0.02)
+        assert monitor.ok is False
+        served[0] = dict(KAIA_TOOL_SCOPES)
+        deadline = time.time() + 5
+        while not monitor.ok and time.time() < deadline:
+            time.sleep(0.02)
+        assert monitor.ok is True and calls["n"] >= 3
+    finally:
+        monitor.stop()
+    n = calls["n"]
+    time.sleep(0.2)
+    assert calls["n"] == n  # stopped
+
+
+def test_drift_monitor_starts_failed_closed_without_a_passing_check() -> None:
+    monitor = DriftMonitor("u", KAIA_TOOL_SCOPES, interval=60, fetch=lambda url, **_: (200, {"tool_scopes": dict(KAIA_TOOL_SCOPES)}))
+    assert monitor.ok is False  # no check yet: closed
+    monitor.check_once()
+    assert monitor.ok is True
+    with pytest.raises(ValueError):
+        DriftMonitor("u", KAIA_TOOL_SCOPES, interval=0)
+
+
+def test_build_config_drift_interval_zero_means_startup_check_only(rig_factory: Any) -> None:
+    rig = rig_factory(drift_interval=0)
+    assert rig.config.drift is None
