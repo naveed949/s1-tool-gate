@@ -28,7 +28,8 @@ with the device flow against kaia-mcp's demo IdP, and proves:
   drift-runtime-fail-closed  proxy running with --drift-interval 1: the map changes -> tools/call
                              denied (claims_tool_scope_drift, not forwarded); map restored -> allowed
   allow-read                 OPTIONAL: get_block_number returns live mainnet data. Needs the public
-                             Kaia RPC; reported as SKIP (not a failure) when the RPC is unreachable
+                             Kaia RPC; SKIP (not a failure) only when an eth_blockNumber probe fails
+                             before the call. Once the tools/call runs, any failure is a FAIL
   expired-denied             after the access-token TTL -> claims_expired
   audit-denies-never-forwarded   no deny/escalate audit line was forwarded
   no-token-in-logs           no token or secret appears in kaia, proxy, or audit logs
@@ -59,6 +60,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, ClassVar
@@ -198,6 +200,26 @@ def reset_evidence(evidence: Path) -> None:
     for pattern in EVIDENCE_PATTERNS:
         for stale in evidence.glob(pattern):
             stale.unlink()
+
+
+def run_allow_read(r: Run, probe: Callable[[], tuple[bool, str]], call: Callable[[], tuple[bool, dict[str, Any]]]) -> None:
+    """The optional ``allow-read`` check.
+
+    SKIP only when ``probe`` (an RPC reachability check) fails *before* the call.
+    Once the tools/call has run, any failure (or exception) is a FAIL: the RPC is
+    not re-probed, so a gate bug can never be downgraded to a SKIP by an RPC
+    outage that happens afterwards.
+    """
+    reachable, detail = probe()
+    if not reachable:
+        r.skip("allow-read", f"Kaia RPC unreachable before the call: {detail}")
+        return
+    try:
+        ok, observed = call()
+    except Exception as err:  # noqa: BLE001 - the call ran: any error is a FAIL, never a SKIP
+        r.check("allow-read", False, error=f"{type(err).__name__}: {err}", rpcProbe=detail)
+        return
+    r.check("allow-read", ok, **observed, rpcProbe=detail)
 
 
 def summarize(checks: list[dict[str, Any]]) -> dict[str, Any]:
@@ -553,12 +575,10 @@ def main() -> int:
             kaiaToolCallLines=[n0, n1, n2], transitionsLogged=["ok -> drift" in rt_text, "drift -> ok" in rt_text],
         )
 
-        # Optional live chain read: SKIP (not FAIL) when the public RPC is unreachable.
+        # Optional live chain read: SKIP (not FAIL) only when the public RPC is unreachable before the call.
         rpc_url = os.environ.get("KAIA_RPC_URL") or DEFAULT_KAIA_RPC
-        reachable, probe = rpc_reachable(rpc_url)
-        if not reachable:
-            r.skip("allow-read", f"Kaia RPC unreachable before the call: {probe}")
-        else:
+
+        def read_block() -> tuple[bool, dict[str, Any]]:
             t5 = device_login(kaia_url, "kaia:read")
             r.tokens += [t5["access_token"], t5["refresh_token"]]
             m5 = Mcp(proxy_url, t5["access_token"])
@@ -568,12 +588,9 @@ def main() -> int:
             text = result_text(body)
             block = re.search(r"\d{6,}", text)
             ok = st == 200 and "error" not in (body or {}) and block is not None and tool_calls(kaia_log, "get_block_number") == before_read + 1
-            observed = {"status": st, "resultText": text[:200], "kaiaToolCallLines": tool_calls(kaia_log, "get_block_number"), "rpcProbe": probe}
-            still, probe_after = (True, probe) if ok else rpc_reachable(rpc_url)
-            if not ok and not still:
-                r.skip("allow-read", f"Kaia RPC became unreachable during the call: {probe_after}", **observed)
-            else:
-                r.check("allow-read", ok, **observed)
+            return ok, {"status": st, "resultText": text[:200], "kaiaToolCallLines": tool_calls(kaia_log, "get_block_number")}
+
+        run_allow_read(r, lambda: rpc_reachable(rpc_url), read_block)
 
         wait = claims["exp"] - time.time() + 1.5
         if wait > 0:

@@ -98,3 +98,52 @@ def test_reused_evidence_dir_is_reset_to_this_run(tmp_path: Path) -> None:
         (tmp_path / name).write_text("stale\n")
     live.reset_evidence(tmp_path)
     assert sorted(p.name for p in tmp_path.iterdir()) == ["live-e2e.stdout", "notes.txt"]
+
+
+# ---- allow-read classification: only the pre-call probe may turn it into a SKIP ----
+
+
+class _Probe:
+    def __init__(self, *answers: tuple[bool, str]) -> None:
+        self.answers = list(answers)
+        self.calls = 0
+
+    def __call__(self) -> tuple[bool, str]:
+        self.calls += 1
+        return self.answers.pop(0)
+
+
+def test_allow_read_skips_only_when_the_pre_call_probe_fails(tmp_path: Path) -> None:
+    r = live.Run(tmp_path)
+    probe = _Probe((False, "http://127.0.0.1:9: URLError"))
+    called: list[bool] = []
+    live.run_allow_read(r, probe, lambda: called.append(True) or (True, {}))
+    assert called == [] and probe.calls == 1
+    assert r.checks[0]["result"] == "SKIP" and "before the call" in r.checks[0]["skipReason"]
+    assert live.summarize(r.checks)["ok"] is False  # a lone SKIP is not a pass
+
+
+def test_allow_read_failure_after_the_call_ran_is_fail_even_if_rpc_then_dies(tmp_path: Path) -> None:
+    r = live.Run(tmp_path)
+    # reachable before the call; a re-probe (if any) would say unreachable
+    probe = _Probe((True, "eth_blockNumber=0x10"), (False, "went away"))
+    live.run_allow_read(r, probe, lambda: (False, {"status": 200, "resultText": "gate bug"}))
+    assert probe.calls == 1  # no re-probe after the call
+    assert (r.checks[0]["check"], r.checks[0]["result"], r.checks[0]["ok"]) == ("allow-read", "FAIL", False)
+    assert live.summarize(r.checks)["failed"] == 1
+
+
+def test_allow_read_call_exception_is_fail(tmp_path: Path) -> None:
+    r = live.Run(tmp_path)
+
+    def boom() -> tuple[bool, dict[str, Any]]:
+        raise ConnectionResetError("reset by proxy")
+
+    live.run_allow_read(r, _Probe((True, "ok")), boom)
+    assert r.checks[0]["result"] == "FAIL" and "ConnectionResetError" in r.checks[0]["error"]
+
+
+def test_allow_read_pass(tmp_path: Path) -> None:
+    r = live.Run(tmp_path)
+    live.run_allow_read(r, _Probe((True, "eth_blockNumber=0x10")), lambda: (True, {"status": 200}))
+    assert r.checks[0]["result"] == "PASS" and r.checks[0]["rpcProbe"] == "eth_blockNumber=0x10"
