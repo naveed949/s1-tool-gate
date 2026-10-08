@@ -149,6 +149,13 @@ class Rig:
         return r.status, {k.lower(): v for k, v in r.getheaders()}, data
 
 
+class _FakeUpstreamServer(ThreadingHTTPServer):
+    # Same backlog as the proxy, so a concurrency test measures the proxy, not this fake
+    # (socketserver's default of 5 made the fake drop forwarded/introspection connections).
+    request_queue_size = 128
+    daemon_threads = True
+
+
 def _serve(server: ThreadingHTTPServer) -> threading.Thread:
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -161,7 +168,7 @@ def rig_factory() -> Iterator[Any]:
 
     def make(*, introspection: bool = True, audience: str = "kaia-mcp", fake: FakeKaia | None = None, **config_kw: Any) -> Rig:
         fake = fake or FakeKaia(signer=TestSigner.generate(kid="kid-1"))
-        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _fake_handler(fake))
+        upstream = _FakeUpstreamServer(("127.0.0.1", 0), _fake_handler(fake))
         servers.append(upstream)
         _serve(upstream)
         fake.issuer = f"http://127.0.0.1:{upstream.server_address[1]}"
