@@ -467,6 +467,28 @@ def test_approved_escalation_forwards_exactly_one_matching_retry(rig_factory: An
     assert len(rig.fake.mcp_requests) == 1
 
 
+def test_approval_is_spent_even_when_the_upstream_call_fails(rig_factory: Any, tmp_path: Any) -> None:
+    """Pinned (fail closed): the approval is consumed before forwarding; a failed upstream call re-escalates."""
+    import socket
+
+    store = EscalationStore(tmp_path / "esc")
+    rig = rig_factory(escalations=store)
+    eid = _err(rig.post(CALL("generate_wallet"), rig.token("kaia:wallet", sub="alice"))[2])["data"]["escalationId"]
+    store.approve(eid)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        dead = f"http://127.0.0.1:{s.getsockname()[1]}"
+    live_upstream, rig.config.upstream = rig.config.upstream, dead
+    status, _, data = rig.post(CALL("generate_wallet", 2), rig.token("kaia:wallet", sub="alice"))
+    assert status == 502 and json.loads(data)["error"]["data"]["choice"] == "allow"
+    assert store.get(eid).status == "consumed"  # spent on the failed call
+    assert rig.audit[-1]["event"] == "upstream_error" and rig.audit[-1]["stage"] == "escalation" and rig.audit[-1]["escalationId"] == eid
+    rig.config.upstream = live_upstream  # upstream back: the same retry needs a new approval
+    err = _err(rig.post(CALL("generate_wallet", 3), rig.token("kaia:wallet", sub="alice"))[2])
+    assert err["code"] == ESCALATE_CODE and err["data"]["escalationId"] != eid and err["data"]["escalationStatus"] == "pending"
+    assert rig.fake.mcp_requests == []
+
+
 def test_approval_never_overrides_a_scope_deny(rig_factory: Any, tmp_path: Any) -> None:
     store = EscalationStore(tmp_path / "esc")
     rig = rig_factory(escalations=store)

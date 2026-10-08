@@ -142,6 +142,10 @@ When the policy escalates a call, the proxy:
 2. denies it (`-32050`, `claims_escalation_denied`, with the `escalationId`) if a human denied the identical request and the deny window is still open;
 3. otherwise answers `-32051` with the existing `pending` row's id, or a new one.
 
+**What an approval binds to.** An approval matches on `sub` + `tool` + `argsHash`, not on a specific token: any valid token for the same subject (for example a refreshed one) can use it, and a different subject cannot. `argsHash` is sha256 over the canonical JSON of the *exact* `params.arguments` (sorted keys, no whitespace, `ensure_ascii=False`). There is no Unicode or other normalization, so arguments that differ only in Unicode form (NFC vs NFD), number spelling (`1` vs `1.0`), or string case are different requests and need their own approval.
+
+**An approval is spent before the call is forwarded (fail closed).** The row becomes `consumed` in the same transaction that decides *allow*, before the proxy contacts kaia-mcp. If the upstream call then fails (connection error → HTTP 502 `-32052`, or an error from kaia-mcp itself), the approval is still used up; the caller must retry, get a new escalation id, and ask a human again. This is deliberate: a two-phase "reserve, then confirm after success" scheme was rejected because it is more complex and risks executing the same wallet call twice.
+
 Approval only turns an *escalate* into one allow. The claims policy runs first, so a token without `kaia:wallet` is still denied (`claims_insufficient_scope`) whatever the queue says. A different subject, tool, or argument set is a different request. Any queue error denies (`claims_escalation_unavailable`), and a queue directory that cannot be opened stops the proxy from starting (exit 3). `approve` only works on `pending`; `deny` works on `pending` or unused `approved`. The CLI exits 1 for any other transition.
 
 ### Live e2e

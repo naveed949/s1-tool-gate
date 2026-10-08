@@ -291,3 +291,14 @@ def test_decisions_guard_on_current_status(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.undo()
     assert s.get(e.id).status == "consumed"
     assert s.on_escalate("alice", "generate_wallet", H, "r").action == "escalate"
+
+
+def test_args_hash_is_over_exact_args_without_normalization() -> None:
+    """Documented: no Unicode/number normalization; differently spelled args are different requests."""
+    import unicodedata
+
+    nfc, nfd = unicodedata.normalize("NFC", "caf\u00e9"), unicodedata.normalize("NFD", "caf\u00e9")
+    assert nfc != nfd
+    assert args_hash({"label": nfc}) != args_hash({"label": nfd})
+    assert args_hash({"n": 1}) != args_hash({"n": 1.0})
+    assert args_hash({"label": "A"}) != args_hash({"label": "a"})
