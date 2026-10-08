@@ -30,7 +30,10 @@ The proxy calls ``on_escalate`` whenever the claims policy says *escalate*:
 Each call is one ``BEGIN IMMEDIATE`` transaction, so a single approval can never
 be consumed twice, even across proxy threads or processes. Every state-changing
 UPDATE is also guarded on the row's current status and must change exactly one
-row, or the transition is refused (consume: not allowed; approve/deny: error). Arguments are never
+row, or the transition is refused (consume: not allowed; approve/deny: error).
+Each transaction first ensures the schema (``CREATE TABLE IF NOT EXISTS``): a db
+deleted at runtime is recreated empty and private (no approval survives), and
+requests racing that recreation escalate normally instead of failing. Arguments are never
 stored, only their hash. Approval can only turn an *escalate* into one allow;
 it can never override a deny (the policy runs first).
 """
@@ -39,6 +42,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import secrets
 import sqlite3
@@ -134,8 +138,8 @@ class EscalationStore:
         approval_ttl: float = DEFAULT_APPROVAL_TTL,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        if pending_ttl <= 0 or approval_ttl <= 0:
-            raise ValueError("escalation TTLs must be positive")
+        if not all(math.isfinite(t) and t > 0 for t in (pending_ttl, approval_ttl)):
+            raise ValueError(f"escalation TTLs must be finite and positive (got pending={pending_ttl}, approval={approval_ttl})")
         self.directory = Path(directory)
         self.path = self.directory / DB_FILENAME
         self.pending_ttl = float(pending_ttl)
@@ -144,7 +148,7 @@ class EscalationStore:
         self._create_private()
         os.chmod(self.directory, 0o700)
         os.chmod(self.path, 0o600)
-        with self._tx(schema=True):
+        with self._tx():
             pass
 
     # ---- plumbing --------------------------------------------------------
@@ -167,18 +171,24 @@ class EscalationStore:
         return True
 
     @contextmanager
-    def _tx(self, *, schema: bool = False) -> Iterator[sqlite3.Connection]:
+    def _tx(self) -> Iterator[sqlite3.Connection]:
         # A db deleted at runtime is recreated private and empty (fail closed: no
         # approval survives; the next escalation is a fresh pending request).
-        schema = self._create_private() or schema
-        db = sqlite3.connect(self.path, timeout=5.0, isolation_level=None)
+        self._create_private()
+        # mode=rw: sqlite never creates the file itself (it would use the process
+        # umask). If the file vanishes between the line above and here, connect
+        # fails and the caller denies (claims_escalation_unavailable).
+        db = sqlite3.connect(f"{self.path.resolve().as_uri()}?mode=rw", uri=True, timeout=5.0, isolation_level=None)
         try:
             db.execute("BEGIN IMMEDIATE")
             try:
-                if schema:
-                    for stmt in _SCHEMA.split(";"):
-                        if stmt.strip():
-                            db.execute(stmt)
+                # The schema is ensured inside every write transaction, not only by the
+                # request that recreated the file: after a runtime deletion a racing
+                # request can see the new empty file and take the write lock before
+                # its creator, and must still find the table (IF NOT EXISTS: no-op).
+                for stmt in _SCHEMA.split(";"):
+                    if stmt.strip():
+                        db.execute(stmt)
                 yield db
             except BaseException:
                 db.execute("ROLLBACK")

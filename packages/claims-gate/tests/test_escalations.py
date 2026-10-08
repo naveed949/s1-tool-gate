@@ -179,8 +179,16 @@ def _race(store_dir: Path, barrier: Any, results: Any) -> None:
 def widen_race(monkeypatch: pytest.MonkeyPatch) -> None:
     """Sleep between reading the approved row and updating it, so racing retries overlap.
 
-    Without this the transactions are too short to interleave reliably and a broken
-    lock (deferred BEGIN) would go unnoticed.
+    Without the sleep the transactions are too short to interleave reliably. What the
+    two tests below then catch (mutation-checked, see the S2 evidence): dropping the
+    write lock *and* the guarded consume together (no transaction, or a deferred
+    transaction whose first write comes after the read, plus an unguarded UPDATE)
+    lets more than one retry through. They do not prove ``BEGIN IMMEDIATE`` on its
+    own is needed: a deferred ``BEGIN`` whose first statement is a write is just as
+    serialized, and with the schema statement first (a read once the table exists)
+    a deferred ``BEGIN`` shows up here only as ``database is locked`` errors, which
+    the proxy turns into a deny. The status guard plus rowcount check is pinned
+    separately by ``test_consume_requires_exactly_one_row_updated``.
     """
     import time as _time
 
@@ -325,3 +333,87 @@ def test_db_deleted_at_runtime_is_recreated_private(tmp_path: Path, remove: str)
     assert stat.S_IMODE(s.path.stat().st_mode) == 0o600
     assert stat.S_IMODE(s.directory.stat().st_mode) == 0o700
     assert [e.id for e in s.list()] == [out.escalation.id]
+
+
+# ---- db recreated at runtime: racing requests escalate, never error or allow ---
+
+
+def test_schema_is_ensured_inside_every_transaction(tmp_path: Path) -> None:
+    """Another request created the (empty) db file but has not made the table yet.
+
+    This is the state a racing request sees right after a runtime deletion: the file
+    exists, so the old code skipped the schema and failed with 'no such table'.
+    """
+    import os
+
+    clock = Clock()
+    s = store(tmp_path, clock)
+    e = s.on_escalate("alice", "generate_wallet", H, "r").escalation
+    s.approve(e.id)
+    s.path.unlink()
+    fd = os.open(s.path, os.O_CREAT | os.O_WRONLY, 0o600)  # what _create_private leaves behind
+    os.close(fd)
+    out = s.on_escalate("alice", "generate_wallet", H, "r")
+    assert out.action == "escalate" and out.escalation.status == "pending"  # the old approval is gone
+    assert [r.status for r in s.list()] == ["pending"]
+
+
+def test_db_vanishing_before_connect_fails_closed_without_a_umask_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """sqlite must never create the db itself (it would use the umask): it errors, the proxy denies."""
+    import sqlite3
+
+    s = store(tmp_path, Clock())
+    s.path.unlink()
+    monkeypatch.setattr(s, "_create_private", lambda: False)  # file deleted after the existence check
+    with pytest.raises(sqlite3.OperationalError):
+        s.on_escalate("alice", "generate_wallet", H, "r")
+    assert not s.path.exists()
+
+
+DELETE_RACE_TRIALS = 20
+
+
+def test_db_deleted_at_runtime_concurrent_retries_all_escalate(tmp_path: Path) -> None:
+    """Repro of the round-2 finding: 12 racing retries right after the db is deleted.
+
+    Every one must escalate (no 'no such table' -> claims_escalation_unavailable),
+    they share exactly one fresh pending row, and the deleted approval never allows.
+    """
+    import threading
+
+    outcomes: list[str] = []
+    for trial in range(DELETE_RACE_TRIALS):
+        s = EscalationStore(tmp_path / f"q{trial}")
+        e = s.on_escalate("alice", "generate_wallet", H, "r").escalation
+        s.approve(e.id)
+        s.path.unlink()
+        barrier = threading.Barrier(N_RETRIES)
+        res: list[str] = []
+        lock = threading.Lock()
+
+        def one(s: EscalationStore = s, barrier: threading.Barrier = barrier, res: list[str] = res) -> None:
+            barrier.wait(timeout=30)
+            try:
+                action = s.on_escalate("alice", "generate_wallet", H, "r").action
+            except Exception as err:  # noqa: BLE001 - surfaced as a non-action result
+                action = f"error:{type(err).__name__}:{err}"
+            with lock:
+                res.append(action)
+
+        threads = [threading.Thread(target=one) for _ in range(N_RETRIES)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        outcomes += res
+        assert [r.status for r in s.list()] == ["pending"], (trial, [(r.id, r.status) for r in s.list()])
+        assert stat.S_IMODE(s.path.stat().st_mode) == 0o600
+    assert outcomes == ["escalate"] * (DELETE_RACE_TRIALS * N_RETRIES), sorted(set(outcomes))
+
+
+@pytest.mark.parametrize("ttl", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+def test_escalation_ttls_must_be_finite_and_positive(tmp_path: Path, ttl: float) -> None:
+    with pytest.raises(ValueError):
+        EscalationStore(tmp_path / "a", pending_ttl=ttl)
+    with pytest.raises(ValueError):
+        EscalationStore(tmp_path / "b", approval_ttl=ttl)
