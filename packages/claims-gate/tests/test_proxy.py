@@ -18,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import pytest
+from claims_gate.escalations import EscalationStore, args_hash
 from claims_gate.kaia import KAIA_TOOL_SCOPES, kaia_policy
 from claims_gate.proxy import (
     DENY_CODE,
@@ -121,6 +122,7 @@ class Rig:
     proxy_port: int
     audit: list[dict[str, Any]]
     now: float
+    config: Any = None
 
     def token(self, scope: str = "kaia:read", *, signer: TestSigner | None = None, **kw: Any) -> str:
         claims = build_claims(now=self.now, iss=kw.pop("iss", self.fake.issuer), scope=scope, **kw)
@@ -149,7 +151,7 @@ def _serve(server: ThreadingHTTPServer) -> threading.Thread:
 def rig_factory() -> Iterator[Any]:
     servers: list[ThreadingHTTPServer] = []
 
-    def make(*, introspection: bool = True, audience: str = "kaia-mcp", fake: FakeKaia | None = None) -> Rig:
+    def make(*, introspection: bool = True, audience: str = "kaia-mcp", fake: FakeKaia | None = None, **config_kw: Any) -> Rig:
         fake = fake or FakeKaia(signer=TestSigner.generate(kid="kid-1"))
         upstream = ThreadingHTTPServer(("127.0.0.1", 0), _fake_handler(fake))
         servers.append(upstream)
@@ -165,12 +167,13 @@ def rig_factory() -> Iterator[Any]:
             introspection_client_id=GATEWAY[0],
             introspection_client_secret=GATEWAY[1],
             audit=audit.append,
+            **config_kw,
         )
         assert config is not None, report.errors
         proxy = make_server(config)
         servers.append(proxy)
         _serve(proxy)
-        return Rig(fake, proxy.server_address[1], audit, time.time())
+        return Rig(fake, proxy.server_address[1], audit, time.time(), config)
 
     yield make
     for s in servers:
@@ -182,7 +185,7 @@ def _err(data: bytes) -> dict[str, Any]:
     return json.loads(data)["error"]
 
 
-CALL = lambda tool, i=1: {"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": tool, "arguments": {}}}
+CALL = lambda tool, i=1, args=None: {"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": tool, "arguments": args if args is not None else {}}}
 
 
 def test_allow_forwards_unchanged_with_session_and_auth(rig_factory: Any) -> None:
@@ -405,3 +408,82 @@ def test_build_config_fails_closed() -> None:
     assert cfg is None and rep.errors == ["tool-scope drift check failed"]
     cfg, rep = build_config(**kw, drift_check=False, fetch=fetcher(good, {"get_block": "kaia:read"}))
     assert cfg is not None
+
+
+# ---- escalation queue (approve once) ----------------------------------------
+
+
+def test_wallet_escalation_is_queued_with_its_id(rig_factory: Any, tmp_path: Any) -> None:
+    store = EscalationStore(tmp_path / "esc")
+    rig = rig_factory(escalations=store)
+    status, _, data = rig.post(CALL("generate_wallet", 5, {"label": "x"}), rig.token("kaia:wallet", sub="alice"))
+    err = _err(data)
+    assert (status, err["code"], err["data"]["reasonCode"]) == (200, ESCALATE_CODE, "claims_wallet_escalate")
+    [rec] = store.list()
+    assert err["data"]["escalationId"] == rec.id
+    assert err["data"]["escalationStatus"] == "pending"
+    assert (rec.sub, rec.tool, rec.args_hash, rec.status) == ("alice", "generate_wallet", args_hash({"label": "x"}), "pending")
+    assert rig.fake.mcp_requests == []
+    assert rig.audit[-1]["escalationId"] == rec.id
+
+
+def test_approved_escalation_forwards_exactly_one_matching_retry(rig_factory: Any, tmp_path: Any) -> None:
+    store = EscalationStore(tmp_path / "esc")
+    rig = rig_factory(escalations=store)
+    tok = rig.token("kaia:wallet", sub="alice")
+    eid = _err(rig.post(CALL("generate_wallet"), tok)[2])["data"]["escalationId"]
+    store.approve(eid)
+    # different args or a different subject do not use the approval
+    assert _err(rig.post(CALL("generate_wallet", 2, {"n": 1}), tok)[2])["code"] == ESCALATE_CODE
+    assert _err(rig.post(CALL("generate_wallet", 3), rig.token("kaia:wallet", sub="mallory"))[2])["code"] == ESCALATE_CODE
+    assert rig.fake.mcp_requests == []
+    # the matching retry (fresh token, same subject) goes through once
+    status, _, data = rig.post(CALL("generate_wallet", 4), rig.token("kaia:wallet", sub="alice"))
+    assert status == 200 and json.loads(data)["result"] == {"echo": "tools/call"}
+    assert len(rig.fake.mcp_requests) == 1
+    assert rig.audit[-1]["event"] == "allow" and rig.audit[-1]["stage"] == "escalation" and rig.audit[-1]["escalationId"] == eid
+    assert store.get(eid).status == "consumed"
+    err = _err(rig.post(CALL("generate_wallet", 5), tok)[2])
+    assert err["code"] == ESCALATE_CODE and err["data"]["escalationId"] != eid
+    assert len(rig.fake.mcp_requests) == 1
+
+
+def test_approval_never_overrides_a_scope_deny(rig_factory: Any, tmp_path: Any) -> None:
+    store = EscalationStore(tmp_path / "esc")
+    rig = rig_factory(escalations=store)
+    eid = _err(rig.post(CALL("generate_wallet"), rig.token("kaia:wallet", sub="alice"))[2])["data"]["escalationId"]
+    store.approve(eid)
+    err = _err(rig.post(CALL("generate_wallet"), rig.token("kaia:read", sub="alice"))[2])
+    assert (err["code"], err["data"]["reasonCode"]) == (DENY_CODE, "claims_insufficient_scope")
+    assert rig.fake.mcp_requests == [] and store.get(eid).status == "approved"
+
+
+def test_denied_escalation_retry_is_denied(rig_factory: Any, tmp_path: Any) -> None:
+    store = EscalationStore(tmp_path / "esc")
+    rig = rig_factory(escalations=store)
+    tok = rig.token("kaia:wallet", sub="alice")
+    eid = _err(rig.post(CALL("generate_wallet"), tok)[2])["data"]["escalationId"]
+    store.deny(eid)
+    err = _err(rig.post(CALL("generate_wallet", 2), tok)[2])
+    assert err["code"] == DENY_CODE
+    assert err["data"]["reasonCode"] == "claims_escalation_denied" and err["data"]["escalationId"] == eid
+    assert rig.fake.mcp_requests == []
+
+
+def test_escalation_store_failure_fails_closed(rig_factory: Any) -> None:
+    class Broken:
+        def on_escalate(self, *a: Any, **k: Any) -> Any:
+            import sqlite3
+
+            raise sqlite3.OperationalError("disk I/O error")
+
+    rig = rig_factory(escalations=Broken())
+    err = _err(rig.post(CALL("generate_wallet"), rig.token("kaia:wallet"))[2])
+    assert (err["code"], err["data"]["reasonCode"]) == (DENY_CODE, "claims_escalation_unavailable")
+    assert rig.fake.mcp_requests == []
+
+
+def test_escalation_without_a_queue_is_terminal(rig_factory: Any) -> None:
+    rig = rig_factory()
+    err = _err(rig.post(CALL("generate_wallet"), rig.token("kaia:wallet"))[2])
+    assert err["code"] == ESCALATE_CODE and err["data"]["escalationStatus"] == "not_queued" and err["data"]["escalationId"]

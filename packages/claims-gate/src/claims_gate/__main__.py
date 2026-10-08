@@ -11,6 +11,9 @@
   python -m claims_gate proxy --upstream URL --issuer ISS --audience AUD [--port N]
       [--introspection auto|URL] [--jwks-uri URL] [--tool-scopes-url URL | --no-drift-check]
       [--audit-log FILE] [--wallet-default escalate|deny]
+      [--escalation-dir DIR [--escalation-pending-ttl S] [--escalation-approval-ttl S]]
+  python -m claims_gate escalations list [--status STATUS] [--dir DIR]
+  python -m claims_gate escalations approve|deny ID [--dir DIR]
 
 ``decide`` reads the Authorization value from the ``S1_AUTHORIZATION`` env var
 (or ``--authorization-file``) so tokens stay out of argv. It prints the
@@ -20,6 +23,9 @@ decision JSON and exits 0 for any decision; exit 2 is a usage/config error.
 until interrupted. It exits 3 without listening if discovery, the JWKS, the
 introspection setup, or the tool-scope drift check fails (fail closed).
 Introspection credentials come from the environment, never argv.
+``escalations`` reads the queue in ``--dir`` (default ``$S1_ESCALATION_DIR``),
+prints JSON, and exits 0; 1 if the approve/deny is not allowed from the
+escalation's current state; 2 if no queue directory was given.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -91,6 +98,32 @@ def _cmd_decide(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_escalations(args: argparse.Namespace) -> int:
+    from claims_gate.escalations import EscalationError, EscalationStore
+
+    directory = args.dir or os.environ.get("S1_ESCALATION_DIR")
+    if not directory:
+        print("claims_gate escalations: pass --dir or set S1_ESCALATION_DIR", file=sys.stderr)
+        return 2
+    store = EscalationStore(directory)
+    if args.action == "list":
+        if args.id:
+            print("claims_gate escalations list takes no id", file=sys.stderr)
+            return 2
+        print(json.dumps([e.to_dict() for e in store.list(args.status)], indent=2))
+        return 0
+    if not args.id:
+        print(f"claims_gate escalations {args.action}: missing escalation id", file=sys.stderr)
+        return 2
+    try:
+        rec = store.approve(args.id) if args.action == "approve" else store.deny(args.id)
+    except EscalationError as err:
+        print(f"claims_gate escalations {args.action}: {err}", file=sys.stderr)
+        return 1
+    print(json.dumps(rec.to_dict(), indent=2))
+    return 0
+
+
 def _cmd_proxy(args: argparse.Namespace) -> int:
     import logging
     import threading
@@ -108,6 +141,16 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
             with lock, audit_path.open("a") as fh:
                 fh.write(json.dumps(record, sort_keys=True) + "\n")
 
+    escalations = None
+    if args.escalation_dir:
+        from claims_gate.escalations import EscalationStore
+
+        try:
+            escalations = EscalationStore(args.escalation_dir, pending_ttl=args.escalation_pending_ttl, approval_ttl=args.escalation_approval_ttl)
+        except (OSError, ValueError, sqlite3.Error) as err:
+            print(f"claims_gate proxy: refusing to start (fail closed): escalation queue: {err}", file=sys.stderr, flush=True)
+            return 3
+
     config, report = build_config(
         upstream=args.upstream,
         issuer=args.issuer,
@@ -122,6 +165,7 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
         jwks_ttl_seconds=args.jwks_ttl,
         mcp_path=args.mcp_path,
         audit=audit,
+        escalations=escalations,
     )
     print(json.dumps({"startup": report.to_dict()}), flush=True)
     if config is None:
@@ -183,7 +227,17 @@ def main(argv: list[str] | None = None) -> int:
     p_proxy.add_argument("--mcp-path", default="/")
     p_proxy.add_argument("--audit-log", help="append one JSON line per decision (no tokens)")
     p_proxy.add_argument("--wallet-default", choices=["escalate", "deny"], default="escalate")
+    p_proxy.add_argument("--escalation-dir", default=os.environ.get("S1_ESCALATION_DIR") or None, help="durable escalation queue (sqlite) so humans can approve one retry; default $S1_ESCALATION_DIR; unset = escalations are terminal")
+    p_proxy.add_argument("--escalation-pending-ttl", type=float, default=3600.0, help="seconds a pending escalation waits for a human (also how long a deny sticks)")
+    p_proxy.add_argument("--escalation-approval-ttl", type=float, default=300.0, help="seconds an approval stays usable for its one retry")
     p_proxy.set_defaults(func=_cmd_proxy)
+
+    p_esc = sub.add_parser("escalations", help="list, approve, or deny queued escalations")
+    p_esc.add_argument("action", choices=["list", "approve", "deny"])
+    p_esc.add_argument("id", nargs="?")
+    p_esc.add_argument("--dir", help="queue directory (default $S1_ESCALATION_DIR)")
+    p_esc.add_argument("--status", choices=["pending", "approved", "denied", "expired", "consumed"])
+    p_esc.set_defaults(func=_cmd_escalations)
 
     args = parser.parse_args(argv)
     return int(args.func(args))

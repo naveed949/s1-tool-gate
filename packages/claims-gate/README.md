@@ -23,7 +23,7 @@ Checks run in this order. The first failure wins.
 | Wallet-class tool, scope present, `wallet_default="deny"` | deny | `claims_wallet_denied` |
 | Otherwise | allow | `claims_allow` |
 
-The live proxy (below) adds four deny codes of its own:
+The live proxy (below) adds deny codes of its own:
 
 | Check (proxy only) | Choice | `reasonCode` |
 | --- | --- | --- |
@@ -31,6 +31,8 @@ The live proxy (below) adds four deny codes of its own:
 | Introspection is configured and says `active: false` | deny | `claims_token_revoked` |
 | Introspection is configured but unreachable, errors, or answers garbage | deny | `claims_introspection_unavailable` |
 | JSON-RPC batch, unparseable body, or `tools/call` without `params.name` | deny | `claims_malformed_request` |
+| Escalated call whose identical request a human denied (within the deny window) | deny | `claims_escalation_denied` |
+| Escalated call, but the escalation queue cannot be read or written | deny | `claims_escalation_unavailable` |
 
 `probs` is always `{}`. This is a rule, not a model score. `ToolPolicy` refuses `wallet_default="allow"`.
 
@@ -91,12 +93,44 @@ python -m claims_gate proxy --upstream http://127.0.0.1:3100 \
   - Without introspection, a token revoked at kaia-mcp stays usable at the proxy until `exp`. kaia-mcp still rejects it if forwarded.
 - **`tools/call`** runs the claims policy:
   - **deny** → JSON-RPC error `-32050`, `data: {reasonCode, choice, tool, requiredScope}`. Not forwarded.
-  - **escalate** (`generate_wallet`) → JSON-RPC error `-32051`, `data: {reasonCode: "claims_wallet_escalate", escalationId, …}`. Not forwarded.
+  - **escalate** (`generate_wallet`) → JSON-RPC error `-32051`, `data: {reasonCode: "claims_wallet_escalate", escalationId, escalationStatus, …}`. Not forwarded. With `--escalation-dir` a human can approve one retry (see [Escalation queue](#escalation-queue)).
   - **allow** → the request is forwarded byte-for-byte with its headers, including `Authorization` and `Mcp-Session-Id`. The response, including SSE, is streamed back.
 - JSON-RPC **batches are rejected** (`claims_malformed_request`), so a batch cannot hide a `tools/call`.
 - **No token is logged.** Each decision is one log line and, with `--audit-log`, one JSON line with `event`, `reasonCode`, `tool`, `subject`, `forwarded`, and a 12-char token fingerprint.
 - `GET /health` and `GET /.well-known/oauth-protected-resource` are served by the proxy itself. The latter points `authorization_servers` at the issuer.
 - **Startup is fail-closed.** Discovery, JWKS, introspection credentials, and the drift check must all pass, or the proxy prints the reason and exits 3 without listening.
+
+### Escalation queue
+
+Without `--escalation-dir` (or `S1_ESCALATION_DIR`) an escalation is terminal: `-32051` with a random `escalationId` and `escalationStatus: "not_queued"`, and nothing can approve it.
+
+With it, the proxy records every escalation in `<dir>/escalations.sqlite3` (dir mode `700`, file `600`). One row per request:
+
+| Field | Meaning |
+| --- | --- |
+| `id` | 16 hex chars; returned as `error.data.escalationId` |
+| `sub` | verified token subject |
+| `tool` | tool name |
+| `argsHash` | sha256 of the canonical JSON of `params.arguments` (sorted keys, no whitespace). Arguments themselves are never stored. Absent arguments and `{}` hash differently. |
+| `reasonCode` | why the policy escalated (`claims_wallet_escalate`) |
+| `status` | `pending` → `approved` → `consumed`, or `denied`, or `expired` |
+| `createdAt`, `decidedAt`, `consumedAt` | unix seconds |
+| `expiresAt` | pending: decide before this; approved: retry before this; denied: identical retries denied until this |
+| `pendingTtl`, `approvalTtl` | fixed by the proxy when the row is created (`--escalation-pending-ttl`, default 3600s; `--escalation-approval-ttl`, default 300s) |
+
+```bash
+python -m claims_gate escalations list [--status pending] --dir /var/lib/s1/escalations
+python -m claims_gate escalations approve <id> --dir /var/lib/s1/escalations
+python -m claims_gate escalations deny <id> --dir /var/lib/s1/escalations
+```
+
+When the policy escalates a call, the proxy:
+
+1. forwards it **once** if an unexpired `approved` row has the same `sub`, `tool`, and `argsHash`. That row becomes `consumed` in the same sqlite transaction, so one approval can never be used twice, even across threads or processes;
+2. denies it (`-32050`, `claims_escalation_denied`, with the `escalationId`) if a human denied the identical request and the deny window is still open;
+3. otherwise answers `-32051` with the existing `pending` row's id, or a new one.
+
+Approval only turns an *escalate* into one allow. The claims policy runs first, so a token without `kaia:wallet` is still denied (`claims_insufficient_scope`) whatever the queue says. A different subject, tool, or argument set is a different request. Any queue error denies (`claims_escalation_unavailable`), and a queue directory that cannot be opened stops the proxy from starting (exit 3). `approve` only works on `pending`; `deny` works on `pending` or unused `approved`. The CLI exits 1 for any other transition.
 
 ### Live e2e
 

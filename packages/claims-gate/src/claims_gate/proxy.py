@@ -8,7 +8,11 @@ with a JSON-RPC error and are never forwarded.
 For JSON-RPC ``tools/call`` the claims policy decides:
 
 - deny     -> JSON-RPC error ``-32050`` with ``data.reasonCode`` (``claims_*``); not forwarded
-- escalate -> JSON-RPC error ``-32051`` with an escalation id; not forwarded
+- escalate -> JSON-RPC error ``-32051`` with an escalation id; not forwarded.
+              With an escalation queue (``claims_gate.escalations``) the request
+              is recorded as pending; once a human approves it, exactly one
+              retry with the same subject, tool, and arguments hash is
+              forwarded. A human deny makes identical retries ``-32050``.
 - allow    -> the original request is forwarded byte-for-byte, with its
               headers (including ``Authorization`` and ``Mcp-Session-Id``)
 
@@ -32,6 +36,7 @@ import hashlib
 import http.client
 import json
 import logging
+import sqlite3
 import threading
 import time
 import uuid
@@ -43,6 +48,7 @@ from urllib.parse import urlencode, urlsplit
 
 import jwt
 
+from claims_gate.escalations import args_hash
 from claims_gate.policy import ToolPolicy
 from claims_gate.reasons import ClaimsReason
 from claims_gate.verify import (
@@ -262,6 +268,7 @@ class ProxyConfig:
     upstream_timeout: float = 120.0
     audit: Callable[[dict[str, Any]], None] | None = None
     algorithms: tuple[str, ...] = ("RS256", "ES256")
+    escalations: Any = None  # claims_gate.escalations.EscalationStore, or None (escalations are terminal)
 
 
 @dataclass(frozen=True)
@@ -440,13 +447,48 @@ class _Handler(BaseHTTPRequestHandler):
                     self._send(200, _jsonrpc_error(rpc_id, DENY_CODE, f"s1-tool-gate denied {tool}: {decision.reason_code}", {"reasonCode": decision.reason_code, "choice": "deny", "tool": tool, "requiredScope": base["requiredScope"]}))
                     return
                 if decision.choice == "escalate":
-                    escalation_id = str(uuid.uuid4())
-                    self._record(event="escalate", stage="policy", forwarded=False, escalationId=escalation_id, **base)
-                    self._send(200, _jsonrpc_error(rpc_id, ESCALATE_CODE, f"s1-tool-gate escalated {tool}: human review required; not executed", {"reasonCode": decision.reason_code, "choice": "escalate", "tool": tool, "escalationId": escalation_id}))
+                    self._escalate(body, rpc_id, tool, params, check.claims.subject, decision.reason_code, base)
                     return
                 self._forward(body, event_fields={"event": "allow", "stage": "policy", **base})
                 return
         self._forward(body, event_fields={"event": "forward", "stage": "token", "rpcMethod": rpc_method, "tokenFp": check.fp, "subject": check.claims.subject})
+
+    def _escalate(self, body: bytes, rpc_id: Any, tool: str, params: dict[str, Any], subject: str, reason_code: str, base: dict[str, Any]) -> None:
+        """Escalate, or let one human-approved retry through. Any queue error fails closed."""
+        store = self.config.escalations
+        if store is None:
+            escalation_id = str(uuid.uuid4())
+            self._record(event="escalate", stage="policy", forwarded=False, escalationId=escalation_id, escalationStatus="not_queued", **base)
+            self._send(200, _jsonrpc_error(rpc_id, ESCALATE_CODE, f"s1-tool-gate escalated {tool}: human review required; not executed", {"reasonCode": reason_code, "choice": "escalate", "tool": tool, "escalationId": escalation_id, "escalationStatus": "not_queued"}))
+            return
+        ahash = args_hash(params.get("arguments"))
+        try:
+            outcome = store.on_escalate(subject, tool, ahash, reason_code)
+        except (sqlite3.Error, OSError) as err:
+            reason = ClaimsReason.ESCALATION_UNAVAILABLE.value
+            self._record(event="deny", stage="escalation", forwarded=False, queueError=type(err).__name__, **{**base, "reasonCode": reason, "choice": "deny"})
+            self._send(200, _jsonrpc_error(rpc_id, DENY_CODE, f"s1-tool-gate denied {tool}: {reason}", {"reasonCode": reason, "choice": "deny", "tool": tool}))
+            return
+        esc = outcome.escalation
+        fields = {"escalationId": esc.id, "escalationStatus": esc.status, "argsHash": ahash}
+        if outcome.action == "allow":
+            self._forward(body, event_fields={"event": "allow", "stage": "escalation", **base, "choice": "allow", **fields})
+            return
+        if outcome.action == "deny":
+            reason = ClaimsReason.ESCALATION_DENIED.value
+            self._record(event="deny", stage="escalation", forwarded=False, **{**base, "reasonCode": reason, "choice": "deny"}, **fields)
+            self._send(200, _jsonrpc_error(rpc_id, DENY_CODE, f"s1-tool-gate denied {tool}: {reason}", {"reasonCode": reason, "choice": "deny", "tool": tool, "escalationId": esc.id}))
+            return
+        self._record(event="escalate", stage="policy", forwarded=False, **base, **fields)
+        self._send(
+            200,
+            _jsonrpc_error(
+                rpc_id,
+                ESCALATE_CODE,
+                f"s1-tool-gate escalated {tool}: human review required; not executed (escalation {esc.id})",
+                {"reasonCode": reason_code, "choice": "escalate", "tool": tool, **fields, "expiresAt": esc.expires_at},
+            ),
+        )
 
     def _forward(self, body: bytes | None, *, event_fields: dict[str, Any]) -> None:
         up = urlsplit(self.config.upstream)
@@ -535,6 +577,7 @@ def build_config(
     jwks_ttl_seconds: float = 300.0,
     mcp_path: str = "/",
     audit: Callable[[dict[str, Any]], None] | None = None,
+    escalations: Any = None,
     fetch: JsonFetcher = http_json,
 ) -> tuple[ProxyConfig | None, StartupReport]:
     """Resolve discovery, JWKS, introspection, and the drift check. Fail closed: any error -> no config.
@@ -598,6 +641,7 @@ def build_config(
             introspector=introspector,
             mcp_path=mcp_path,
             audit=audit,
+            escalations=escalations,
         ),
         report,
     )

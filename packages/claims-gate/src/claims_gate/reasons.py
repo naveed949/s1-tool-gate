@@ -26,3 +26,5 @@ class ClaimsReason(StrEnum):
     TOKEN_REVOKED = "claims_token_revoked"
     INTROSPECTION_UNAVAILABLE = "claims_introspection_unavailable"
     MALFORMED_REQUEST = "claims_malformed_request"
+    ESCALATION_DENIED = "claims_escalation_denied"
+    ESCALATION_UNAVAILABLE = "claims_escalation_unavailable"
