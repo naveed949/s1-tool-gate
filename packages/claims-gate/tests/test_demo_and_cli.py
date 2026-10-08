@@ -93,4 +93,56 @@ def test_proxy_cli_introspection_cache_defaults_off_and_is_opt_in() -> None:
 def test_proxy_cli_negative_drift_interval_refuses_to_start(capsys: pytest.CaptureFixture[str]) -> None:
     rc = main(["proxy", "--upstream", "http://127.0.0.1:9", "--issuer", "http://127.0.0.1:9", "--audience", "kaia-mcp", "--drift-interval", "-1"])
     assert rc == 3
-    assert "drift interval must be >= 0" in capsys.readouterr().err
+    assert "drift interval must be a finite number in [0, " in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "1e300"])
+def test_proxy_cli_non_finite_drift_interval_refuses_to_start(capsys: pytest.CaptureFixture[str], value: str) -> None:
+    rc = main(["proxy", "--upstream", "http://127.0.0.1:9", "--issuer", "http://127.0.0.1:9", "--audience", "kaia-mcp", f"--drift-interval={value}"])
+    assert rc == 3
+    assert "drift interval must be a finite number in [0, " in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flag", ["--introspection-cache-ttl", "--escalation-pending-ttl", "--escalation-approval-ttl", "--jwks-ttl"])
+@pytest.mark.parametrize("value", ["nan", "inf"])
+def test_proxy_cli_non_finite_durations_refuse_to_start(capsys: pytest.CaptureFixture[str], tmp_path: Any, flag: str, value: str) -> None:
+    rc = main(["proxy", "--upstream", "http://127.0.0.1:9", "--issuer", "http://127.0.0.1:9", "--audience", "kaia-mcp", "--escalation-dir", str(tmp_path / "q"), f"{flag}={value}"])
+    assert rc == 3
+    assert "finite" in capsys.readouterr().err
+
+
+# Upper bounds: a huge finite value (1e300, 9e18) behaves like inf (cache until token
+# exp, keys never refreshed, approvals/denies that never expire), so each flag has a cap.
+_CAPPED_FLAGS = {
+    "--introspection-cache-ttl": "introspection cache TTL must be a finite number in [0, 300",
+    "--jwks-ttl": "jwks TTL must be a finite number in (0, 3600",
+    "--escalation-pending-ttl": "escalation pending TTL must be a finite number in (0, 86400",
+    "--escalation-approval-ttl": "escalation approval TTL must be a finite number in (0, 3600",
+}
+
+
+@pytest.mark.parametrize("flag", sorted(_CAPPED_FLAGS))
+@pytest.mark.parametrize("value", ["1e300", "9e18", "1.8e10", "1e309", "nan", "inf", "-1"])
+def test_proxy_cli_out_of_range_durations_refuse_to_start(capsys: pytest.CaptureFixture[str], tmp_path: Any, flag: str, value: str) -> None:
+    rc = main(["proxy", "--upstream", "http://127.0.0.1:9", "--issuer", "http://127.0.0.1:9", "--audience", "kaia-mcp", "--escalation-dir", str(tmp_path / "q"), f"{flag}={value}"])
+    assert rc == 3
+    err = capsys.readouterr().err
+    assert _CAPPED_FLAGS[flag] in err, err
+    assert err.count(_CAPPED_FLAGS[flag]) == 1, err  # reported once, not by every layer
+
+
+@pytest.mark.parametrize("flag", ["--escalation-pending-ttl", "--escalation-approval-ttl"])
+def test_proxy_cli_escalation_ttls_are_checked_even_without_a_queue(capsys: pytest.CaptureFixture[str], flag: str) -> None:
+    rc = main(["proxy", "--upstream", "http://127.0.0.1:9", "--issuer", "http://127.0.0.1:9", "--audience", "kaia-mcp", f"{flag}=1e300"])
+    assert rc == 3
+    assert _CAPPED_FLAGS[flag] in capsys.readouterr().err
+
+
+def test_duration_caps_are_inclusive_and_defaults_are_inside() -> None:
+    from claims_gate.escalations import DEFAULT_APPROVAL_TTL, DEFAULT_PENDING_TTL, MAX_APPROVAL_TTL, MAX_PENDING_TTL
+    from claims_gate.proxy import DEFAULT_INTROSPECTION_CACHE_TTL, DEFAULT_JWKS_TTL, MAX_INTROSPECTION_CACHE_TTL, MAX_JWKS_TTL
+
+    assert (MAX_INTROSPECTION_CACHE_TTL, MAX_JWKS_TTL, MAX_PENDING_TTL, MAX_APPROVAL_TTL) == (300.0, 3600.0, 86400.0, 3600.0)
+    assert 0 <= DEFAULT_INTROSPECTION_CACHE_TTL <= MAX_INTROSPECTION_CACHE_TTL
+    assert 0 < DEFAULT_JWKS_TTL <= MAX_JWKS_TTL
+    assert 0 < DEFAULT_PENDING_TTL <= MAX_PENDING_TTL and 0 < DEFAULT_APPROVAL_TTL <= MAX_APPROVAL_TTL

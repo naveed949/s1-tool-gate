@@ -30,7 +30,10 @@ The proxy calls ``on_escalate`` whenever the claims policy says *escalate*:
 Each call is one ``BEGIN IMMEDIATE`` transaction, so a single approval can never
 be consumed twice, even across proxy threads or processes. Every state-changing
 UPDATE is also guarded on the row's current status and must change exactly one
-row, or the transition is refused (consume: not allowed; approve/deny: error). Arguments are never
+row, or the transition is refused (consume: not allowed; approve/deny: error).
+Each transaction first ensures the schema (``CREATE TABLE IF NOT EXISTS``): a db
+deleted at runtime is recreated empty and private (no approval survives), and
+requests racing that recreation escalate normally instead of failing. Arguments are never
 stored, only their hash. Approval can only turn an *escalate* into one allow;
 it can never override a deny (the policy runs first).
 """
@@ -49,9 +52,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from claims_gate.durations import duration_error
+
 DB_FILENAME = "escalations.sqlite3"
 DEFAULT_PENDING_TTL = 3600.0
 DEFAULT_APPROVAL_TTL = 300.0
+# Upper bounds (a huge finite TTL is a pending request, deny, or approval that never
+# expires). Pending: one day is a full review window for a human; after it a retry
+# simply re-asks (a fresh pending row, never an allow), and a deny sticks this long.
+MAX_PENDING_TTL = 86400.0
+# Approval: an approval is a one-shot for the caller's *immediate* retry (default 5 min);
+# an hour covers a slow retry loop without leaving an approved call usable for long.
+MAX_APPROVAL_TTL = 3600.0
 STATUSES = ("pending", "approved", "denied", "expired", "consumed")
 
 Action = Literal["allow", "escalate", "deny"]
@@ -79,6 +91,18 @@ _COLUMNS = "id, sub, tool, args_hash, reason_code, status, created_at, expires_a
 
 class EscalationError(Exception):
     """An approve/deny that is not allowed from the escalation's current state."""
+
+
+def ttl_errors(pending_ttl: float, approval_ttl: float) -> list[str]:
+    """Every out-of-range escalation TTL, as error text (empty if both are fine)."""
+    return [
+        e
+        for e in (
+            duration_error("escalation pending TTL", pending_ttl, maximum=MAX_PENDING_TTL),
+            duration_error("escalation approval TTL", approval_ttl, maximum=MAX_APPROVAL_TTL),
+        )
+        if e is not None
+    ]
 
 
 def args_hash(arguments: Any) -> str:
@@ -134,8 +158,9 @@ class EscalationStore:
         approval_ttl: float = DEFAULT_APPROVAL_TTL,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        if pending_ttl <= 0 or approval_ttl <= 0:
-            raise ValueError("escalation TTLs must be positive")
+        errors = ttl_errors(pending_ttl, approval_ttl)
+        if errors:
+            raise ValueError("; ".join(errors))
         self.directory = Path(directory)
         self.path = self.directory / DB_FILENAME
         self.pending_ttl = float(pending_ttl)
@@ -144,18 +169,17 @@ class EscalationStore:
         self._create_private()
         os.chmod(self.directory, 0o700)
         os.chmod(self.path, 0o600)
-        with self._tx(schema=True):
+        with self._tx():
             pass
 
     # ---- plumbing --------------------------------------------------------
-    def _create_private(self) -> bool:
+    def _create_private(self) -> None:
         """Create the dir (700) and db file (600) if missing, before sqlite can create them.
 
         sqlite would otherwise create a deleted db with the process umask (often 644).
-        Returns True if the db file was missing.
         """
         if self.path.exists():
-            return False
+            return
         if not self.directory.is_dir():
             self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             os.chmod(self.directory, 0o700)
@@ -164,21 +188,26 @@ class EscalationStore:
             os.fchmod(fd, 0o600)
         finally:
             os.close(fd)
-        return True
 
     @contextmanager
-    def _tx(self, *, schema: bool = False) -> Iterator[sqlite3.Connection]:
+    def _tx(self) -> Iterator[sqlite3.Connection]:
         # A db deleted at runtime is recreated private and empty (fail closed: no
         # approval survives; the next escalation is a fresh pending request).
-        schema = self._create_private() or schema
-        db = sqlite3.connect(self.path, timeout=5.0, isolation_level=None)
+        self._create_private()
+        # mode=rw: sqlite never creates the file itself (it would use the process
+        # umask). If the file vanishes between the line above and here, connect
+        # fails and the caller denies (claims_escalation_unavailable).
+        db = sqlite3.connect(f"{self.path.resolve().as_uri()}?mode=rw", uri=True, timeout=5.0, isolation_level=None)
         try:
             db.execute("BEGIN IMMEDIATE")
             try:
-                if schema:
-                    for stmt in _SCHEMA.split(";"):
-                        if stmt.strip():
-                            db.execute(stmt)
+                # The schema is ensured inside every write transaction, not only by the
+                # request that recreated the file: after a runtime deletion a racing
+                # request can see the new empty file and take the write lock before
+                # its creator, and must still find the table (IF NOT EXISTS: no-op).
+                for stmt in _SCHEMA.split(";"):
+                    if stmt.strip():
+                        db.execute(stmt)
                 yield db
             except BaseException:
                 db.execute("ROLLBACK")

@@ -13,12 +13,32 @@ For JSON-RPC ``tools/call`` the claims policy decides:
               is recorded as pending; once a human approves it, exactly one
               retry with the same subject, tool, and arguments hash is
               forwarded. A human deny makes identical retries ``-32050``.
-- allow    -> the original request is forwarded byte-for-byte, with its
-              headers (including ``Authorization`` and ``Mcp-Session-Id``)
+- allow    -> the original request body is forwarded byte-for-byte, with its
+              headers line for line (including ``Mcp-Method``/``Mcp-Name``); the
+              ``Authorization`` sent upstream is exactly the value the gate verified
 
-Other methods (``initialize``, ``tools/list``, notifications, responses, the
-SSE ``GET`` and session ``DELETE``) are forwarded once the token is valid.
-JSON-RPC batches and unparseable bodies are rejected (fail closed).
+Ambiguous requests are refused with HTTP 400 (``claims_malformed_request``) before
+the token is even checked: more than one ``Authorization``, ``Host``,
+``Content-Length``, ``Content-Type``, ``Origin``, ``Mcp-Method``, ``Mcp-Name``, or
+``MCP-Protocol-Version`` header line, or a comma-joined ``Authorization`` value.
+Otherwise the gate could decide on one copy (``headers.get`` returns the first)
+while the upstream acts on another.
+
+Other methods (``initialize``, ``tools/list``, notifications, responses) and
+``GET``/``DELETE`` are forwarded once the token is valid (kaia-mcp >= 00f3511
+answers ``GET``/``DELETE`` with 405). JSON-RPC batches and unparseable bodies are
+rejected (fail closed). Decisions use the JSON-RPC body, the thing the upstream
+executes; ``Mcp-Method``/``Mcp-Name`` headers are relayed but never trusted.
+
+Stateless upstream (MCP 2026-07-28): the proxy keeps no session state, never
+forwards a client's ``Mcp-Session-Id`` (any such id is stale: kaia-mcp no longer
+issues one) and drops one from upstream responses. Anything the upstream answers
+after a forward, including its own ``403`` ``insufficient_scope`` with the
+``WWW-Authenticate`` challenge, an ``Origin`` refusal, or a ``405``, is relayed
+unchanged (status, headers, body). The proxy's own policy deny for a missing
+scope stays in-band (HTTP 200, ``-32050`` ``claims_insufficient_scope``) like
+every other gate deny; it is decided before kaia is asked, so kaia's 403 is only
+seen if kaia's own policy is stricter than the gate's.
 
 The proxy never logs or echoes a token. Logs and the audit file carry a
 12-character sha256 fingerprint at most.
@@ -27,8 +47,9 @@ At startup the proxy compares its own kaia tool -> scope map with the one the
 upstream publishes at ``/.well-known/kaia-mcp/tool-scopes`` and refuses to
 start on any difference or if the map cannot be fetched (unless the drift
 check is explicitly turned off). While running, ``DriftMonitor`` rechecks the
-map as soon as it starts and then every ``drift_interval`` seconds (a negative
-interval is a startup error; 0 = startup check only); on drift or a failed fetch every
+map as soon as it starts and then every ``drift_interval`` seconds (anything but a
+finite number in ``[0, threading.TIMEOUT_MAX]`` is a startup error; 0 = startup
+check only); on drift or a failed fetch every
 ``tools/call`` is denied (``claims_tool_scope_drift``) until the maps match
 again. State transitions are logged and audited.
 """
@@ -40,6 +61,7 @@ import hashlib
 import http.client
 import json
 import logging
+import math
 import sqlite3
 import threading
 import time
@@ -52,6 +74,7 @@ from urllib.parse import urlencode, urlsplit
 
 import jwt
 
+from claims_gate.durations import duration_error
 from claims_gate.escalations import args_hash
 from claims_gate.policy import ToolPolicy
 from claims_gate.reasons import ClaimsReason
@@ -90,8 +113,29 @@ _HOP_BY_HOP = frozenset(
     }
 )
 
+# MCP 2026-07-28 removed protocol sessions (SEP-2567): a client's id is stale and
+# never forwarded, and an upstream one is never handed out.
+_SESSION_HEADER = "mcp-session-id"
+
+# Not forwarded upstream.
+_REQUEST_SKIP = _HOP_BY_HOP | {_SESSION_HEADER}
+
 # Not copied from upstream responses; BaseHTTPRequestHandler writes its own.
-_RESPONSE_SKIP = _HOP_BY_HOP | {"date", "server"}
+_RESPONSE_SKIP = _HOP_BY_HOP | {"date", "server", _SESSION_HEADER}
+
+# Headers that decide who is asking, what is executed, or how the body is framed.
+# More than one line of any of them is refused (400): the gate reads one copy, an
+# upstream or intermediary could read another.
+_SINGLE_VALUED_HEADERS = (
+    "Authorization",
+    "Host",
+    "Content-Length",
+    "Content-Type",
+    "Origin",
+    "Mcp-Method",
+    "Mcp-Name",
+    "MCP-Protocol-Version",
+)
 
 JsonFetcher = Callable[..., Any]
 
@@ -157,6 +201,18 @@ def discover(issuer: str, *, fetch: JsonFetcher = http_json) -> dict[str, Any]:
     return doc
 
 
+DEFAULT_JWKS_TTL = 300.0
+# A key removed from the JWKS (rotated out after a compromise) is still trusted until
+# the cache refreshes; an unknown kid refetches on its own, so the TTL only bounds how
+# long a *removed* key keeps working. One hour keeps that window short and still costs
+# at most one JWKS fetch per hour.
+MAX_JWKS_TTL = 3600.0
+
+
+def jwks_ttl_error(ttl: float) -> str | None:
+    return duration_error("jwks TTL", ttl, maximum=MAX_JWKS_TTL)
+
+
 class JwksCache:
     """JWKS with a TTL and a rate-limited refetch when a token names an unknown ``kid``.
 
@@ -168,11 +224,14 @@ class JwksCache:
         self,
         jwks_uri: str,
         *,
-        ttl_seconds: float = 300.0,
+        ttl_seconds: float = DEFAULT_JWKS_TTL,
         min_refetch_seconds: float = 10.0,
         fetch: JsonFetcher = http_json,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        error = jwks_ttl_error(ttl_seconds)
+        if error is not None:
+            raise ValueError(error)
         self.jwks_uri = jwks_uri
         self._ttl = ttl_seconds
         self._min_refetch = min_refetch_seconds
@@ -212,6 +271,14 @@ class JwksCache:
 # Off by default: every request is introspected, so a revocation applies on the very
 # next request. Operators opt in to a positive TTL and accept that revocation latency.
 DEFAULT_INTROSPECTION_CACHE_TTL = 0.0
+# The TTL *is* the revocation latency at the proxy, so it stays small: five minutes is
+# the usual access-token-cache ceiling and already a long time for a revoked token to
+# keep working. Anything larger is effectively "until exp" for short-lived tokens.
+MAX_INTROSPECTION_CACHE_TTL = 300.0
+
+
+def introspection_cache_ttl_error(ttl: float) -> str | None:
+    return duration_error("introspection cache TTL", ttl, maximum=MAX_INTROSPECTION_CACHE_TTL, allow_zero=True)
 
 
 @dataclass
@@ -238,8 +305,9 @@ class Introspector:
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if self.cache_ttl < 0:
-            raise ValueError("introspection cache TTL must be >= 0")
+        error = introspection_cache_ttl_error(self.cache_ttl)
+        if error is not None:
+            raise ValueError(error)
 
     def _cached_active(self, key: str, now: float) -> bool:
         with self._lock:
@@ -330,8 +398,8 @@ class DriftMonitor:
         audit: Callable[[dict[str, Any]], None] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        if interval <= 0:
-            raise ValueError("drift interval must be positive")
+        if not (math.isfinite(interval) and 0 < interval <= threading.TIMEOUT_MAX):
+            raise ValueError(f"drift interval must be a finite number in (0, {threading.TIMEOUT_MAX}] (got {interval})")
         self.url = url
         self.expected = dict(expected)
         self.interval = float(interval)
@@ -504,6 +572,27 @@ class _Handler(BaseHTTPRequestHandler):
             {"WWW-Authenticate": www},
         )
 
+    def _ambiguous_header(self) -> tuple[str, str] | None:
+        """(header, why) if the request repeats a single-valued header or comma-joins Authorization."""
+        for name in _SINGLE_VALUED_HEADERS:
+            if len(self.headers.get_all(name) or []) > 1:
+                return name, f"more than one {name} header"
+        # RFC 6750 b64token has no comma; a comma means two credentials joined into one line.
+        if "," in (self.headers.get("Authorization") or ""):
+            return "Authorization", "comma-joined Authorization header value"
+        return None
+
+    def _refuse_ambiguous(self) -> bool:
+        """Answer 400 and return True if the request headers are ambiguous. Runs before anything else."""
+        found = self._ambiguous_header()
+        if found is None:
+            return False
+        header, why = found
+        reason = ClaimsReason.MALFORMED_REQUEST.value
+        self._record(event="deny", stage="request", reasonCode=reason, choice="deny", header=header, detail=why, forwarded=False)
+        self._send(400, _jsonrpc_error(None, INVALID_REQUEST_CODE, f"s1-tool-gate: {why}", {"reasonCode": reason, "choice": "deny", "header": header}))
+        return True
+
     def _read_body(self) -> bytes | None:
         length = self.headers.get("Content-Length")
         if length is None:
@@ -518,6 +607,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     # ---- routing -------------------------------------------------------
     def do_GET(self) -> None:
+        if self._refuse_ambiguous():
+            return
         path = urlsplit(self.path).path
         if path == "/health" and self.config.mcp_path != "/health":
             tool_scopes = self.config.drift.status() if self.config.drift is not None else {"periodic": False}
@@ -529,6 +620,8 @@ class _Handler(BaseHTTPRequestHandler):
         self._handle_mcp(body=None)
 
     def do_POST(self) -> None:
+        if self._refuse_ambiguous():
+            return
         body = self._read_body()
         if body is None:
             self._record(event="deny", stage="request", reasonCode=ClaimsReason.MALFORMED_REQUEST.value, forwarded=False)
@@ -537,6 +630,8 @@ class _Handler(BaseHTTPRequestHandler):
         self._handle_mcp(body=body)
 
     def do_DELETE(self) -> None:
+        if self._refuse_ambiguous():
+            return
         self._handle_mcp(body=None)
 
     def _handle_mcp(self, body: bytes | None) -> None:
@@ -556,11 +651,13 @@ class _Handler(BaseHTTPRequestHandler):
                 rpc_id = message.get("id")
                 rpc_method = message.get("method") if isinstance(message.get("method"), str) else None
 
-        check = check_token(self.config, self.headers.get("Authorization"))
+        # The one value that is verified is the one value that is forwarded (_forward).
+        authorization = self.headers.get("Authorization")
+        check = check_token(self.config, authorization)
         if check.reason is not None:
             self._deny_token(check, rpc_id, rpc_method)
             return
-        assert check.claims is not None
+        assert check.claims is not None and authorization is not None
 
         if body is not None and self.command == "POST":
             if not isinstance(message, dict):
@@ -599,13 +696,13 @@ class _Handler(BaseHTTPRequestHandler):
                     self._send(200, _jsonrpc_error(rpc_id, DENY_CODE, f"s1-tool-gate denied {tool}: {decision.reason_code}", {"reasonCode": decision.reason_code, "choice": "deny", "tool": tool, "requiredScope": base["requiredScope"]}))
                     return
                 if decision.choice == "escalate":
-                    self._escalate(body, rpc_id, tool, params, check.claims.subject, decision.reason_code, base)
+                    self._escalate(body, authorization, rpc_id, tool, params, check.claims.subject, decision.reason_code, base)
                     return
-                self._forward(body, event_fields={"event": "allow", "stage": "policy", **base})
+                self._forward(body, authorization, event_fields={"event": "allow", "stage": "policy", **base})
                 return
-        self._forward(body, event_fields={"event": "forward", "stage": "token", "rpcMethod": rpc_method, "tokenFp": check.fp, "subject": check.claims.subject})
+        self._forward(body, authorization, event_fields={"event": "forward", "stage": "token", "rpcMethod": rpc_method, "tokenFp": check.fp, "subject": check.claims.subject})
 
-    def _escalate(self, body: bytes, rpc_id: Any, tool: str, params: dict[str, Any], subject: str, reason_code: str, base: dict[str, Any]) -> None:
+    def _escalate(self, body: bytes, authorization: str, rpc_id: Any, tool: str, params: dict[str, Any], subject: str, reason_code: str, base: dict[str, Any]) -> None:
         """Escalate, or let one human-approved retry through. Any queue error fails closed."""
         store = self.config.escalations
         if store is None:
@@ -624,7 +721,7 @@ class _Handler(BaseHTTPRequestHandler):
         esc = outcome.escalation
         fields = {"escalationId": esc.id, "escalationStatus": esc.status, "argsHash": ahash}
         if outcome.action == "allow":
-            self._forward(body, event_fields={"event": "allow", "stage": "escalation", **base, "choice": "allow", **fields})
+            self._forward(body, authorization, event_fields={"event": "allow", "stage": "escalation", **base, "choice": "allow", **fields})
             return
         if outcome.action == "deny":
             reason = ClaimsReason.ESCALATION_DENIED.value
@@ -642,7 +739,7 @@ class _Handler(BaseHTTPRequestHandler):
             ),
         )
 
-    def _forward(self, body: bytes | None, *, event_fields: dict[str, Any]) -> None:
+    def _forward(self, body: bytes | None, authorization: str, *, event_fields: dict[str, Any]) -> None:
         up = urlsplit(self.config.upstream)
         conn_cls = http.client.HTTPSConnection if up.scheme == "https" else http.client.HTTPConnection
         conn = conn_cls(up.hostname, up.port, timeout=self.config.upstream_timeout)
@@ -650,10 +747,16 @@ class _Handler(BaseHTTPRequestHandler):
         target = (up.path.rstrip("/") + self.config.mcp_path) or "/"
         if query:
             target += "?" + query
-        headers = {k: v for k, v in self.headers.items() if k.lower() not in _HOP_BY_HOP}
+        # Line for line (a dict would keep only the last of repeated lines), and the
+        # Authorization line carries exactly the value check_token verified.
+        headers = [
+            (k, authorization if k.lower() == "authorization" else v)
+            for k, v in self.headers.items()
+            if k.lower() not in _REQUEST_SKIP
+        ]
         try:
             conn.putrequest(self.command, target, skip_accept_encoding=True)
-            for k, v in headers.items():
+            for k, v in headers:
                 conn.putheader(k, v)
             if body is not None and self.command == "POST":
                 conn.putheader("Content-Length", str(len(body)))
@@ -736,7 +839,7 @@ def build_config(
     tool_scopes_url: str | None = None,
     drift_check: bool = True,
     drift_interval: float = 60.0,
-    jwks_ttl_seconds: float = 300.0,
+    jwks_ttl_seconds: float = DEFAULT_JWKS_TTL,
     mcp_path: str = "/",
     audit: Callable[[dict[str, Any]], None] | None = None,
     escalations: Any = None,
@@ -748,8 +851,15 @@ def build_config(
     or an explicit URL. When introspection is on, missing credentials are an error.
     """
     errors: list[str] = []
-    if drift_interval < 0:
-        errors.append(f"drift interval must be >= 0 (got {drift_interval}); 0 = startup check only")
+    # nan compares False with everything and inf overflows Event.wait(): both used to
+    # slip past a plain "< 0" check and silently stop the periodic recheck.
+    if not (math.isfinite(drift_interval) and 0 <= drift_interval <= threading.TIMEOUT_MAX):
+        errors.append(f"drift interval must be a finite number in [0, {threading.TIMEOUT_MAX}] (got {drift_interval}); 0 = startup check only")
+    # Each bad duration is reported once, here; the objects that would re-check it
+    # (JwksCache, Introspector) are then not built.
+    jwks_ttl_err = jwks_ttl_error(jwks_ttl_seconds)
+    cache_ttl_err = introspection_cache_ttl_error(introspection_cache_ttl)
+    errors += [e for e in (jwks_ttl_err, cache_ttl_err) if e is not None]
     resolved_jwks = jwks_uri
     introspection_url: str | None = None
     try:
@@ -776,7 +886,7 @@ def build_config(
     if introspection_url:
         if not introspection_client_id or not introspection_client_secret:
             errors.append("introspection is configured but S1_INTROSPECTION_CLIENT_ID/SECRET are not set")
-        else:
+        elif cache_ttl_err is None:
             try:
                 introspector = Introspector(introspection_url, introspection_client_id, introspection_client_secret, fetch=fetch, cache_ttl=introspection_cache_ttl)
             except ValueError as err:
@@ -789,19 +899,19 @@ def build_config(
         drift = check_tool_scope_drift(scopes_url, policy.tool_scopes, fetch=fetch)
         if not drift["ok"]:
             errors.append("tool-scope drift check failed")
-        elif drift_interval > 0:
+        elif drift_interval > 0 and not errors:
             monitor = DriftMonitor(scopes_url, policy.tool_scopes, interval=drift_interval, fetch=fetch, audit=audit)
             monitor.record(drift)
 
-    cache = JwksCache(resolved_jwks or "", ttl_seconds=jwks_ttl_seconds, fetch=fetch)
-    if resolved_jwks and not errors:
+    cache = JwksCache(resolved_jwks or "", ttl_seconds=jwks_ttl_seconds, fetch=fetch) if jwks_ttl_err is None else None
+    if cache is not None and resolved_jwks and not errors:
         try:
             cache.get(None)
         except UpstreamError as err:
             errors.append(f"jwks: {err}")
 
     report = StartupReport(issuer, audience, resolved_jwks or "", introspection_url, drift, errors)
-    if errors:
+    if errors or cache is None:
         return None, report
     return (
         ProxyConfig(

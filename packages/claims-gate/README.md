@@ -39,7 +39,7 @@ The live proxy (below) adds deny codes of its own:
 
 ## kaia-mcp fixture
 
-`claims_gate.kaia` copies kaia-mcp's real tool → scope map from `naveed949/kaia-mcp@253d6c8:src/auth/scopes.ts`:
+`claims_gate.kaia` copies kaia-mcp's real tool → scope map from `naveed949/kaia-mcp@253d6c8:src/auth/scopes.ts` (still identical at `00f3511`, the live e2e pin):
 
 - `kaia:read` covers 24 read tools (`get_kaia_balance`, `get_block`, `read_contract`, `estimate_gas`, ...).
 - `kaia:encode` covers `encode_function_data`.
@@ -50,7 +50,7 @@ The fixture is copied by hand. A tool kaia-mcp adds later is denied (`claims_unk
 **Drift guard.** The gate keeps owning its map. It does not take policy from the server it guards. Instead, the live proxy fetches kaia-mcp's published map (`GET /.well-known/kaia-mcp/tool-scopes`, added in naveed949/kaia-mcp#3) and compares it with its own:
 
 - At startup, the proxy **refuses to start** (exit 3) if any tool or scope differs, or if the map cannot be fetched.
-- While serving, it rechecks once as soon as it starts listening and then every `--drift-interval` seconds (default 60). A negative interval is refused at startup (exit 3). If the maps differ, or the fetch fails, it **fails closed**: every `tools/call` is denied with `-32050` `claims_tool_scope_drift`, and `error.data.drift` carries the diff or the fetch error. This lasts until a recheck matches again. Other MCP traffic (`initialize`, `tools/list`, …) still needs only a valid token.
+- While serving, it rechecks once as soon as it starts listening and then every `--drift-interval` seconds (default 60). The interval must be a finite number from 0 to Python's `threading.TIMEOUT_MAX`; anything else (negative, `nan`, `inf`, or larger) is refused at startup (exit 3), because `nan` and `inf` would otherwise silently stop the recheck. If the maps differ, or the fetch fails, it **fails closed**: every `tools/call` is denied with `-32050` `claims_tool_scope_drift`, and `error.data.drift` carries the diff or the fetch error. This lasts until a recheck matches again. Other MCP traffic (`initialize`, `tools/list`, …) still needs only a valid token.
   - Each transition (`ok -> drift`, `drift -> ok`) is logged at WARNING and written to the audit log as `drift_failing` / `drift_recovered`.
   - `GET /health` reports `toolScopes: {ok, checkedAt, intervalSeconds, url}`.
 - `--drift-interval 0` keeps only the startup check. `--no-drift-check` turns off both checks, for upstreams that do not publish the map.
@@ -86,18 +86,20 @@ S1_AUTHORIZATION="Bearer $TOKEN" python -m claims_gate decide \
 ```bash
 S1_INTROSPECTION_CLIENT_ID=s1-tool-gate S1_INTROSPECTION_CLIENT_SECRET=... \
 python -m claims_gate proxy --upstream http://127.0.0.1:3100 \
-  --issuer http://127.0.0.1:3100 --audience kaia-mcp --introspection auto \
+  --issuer http://127.0.0.1:3100 --audience http://127.0.0.1:3100 --introspection auto \
   --port 3200 --audit-log /tmp/s1-audit.jsonl
 ```
 
-- **Every request** on the MCP path needs a bearer token that verifies against the issuer's JWKS, with the **pinned** issuer and audience. That includes `initialize`, `tools/list`, notifications, the SSE `GET`, and `DELETE`.
+It targets kaia-mcp `00f3511` or later (MCP 2026-07-28, stateless). See [Audience and kaia's canonical URL](#audience-and-kaias-canonical-url) and [Stateless kaia-mcp](#stateless-kaia-mcp-mcp-2026-07-28).
+
+- **Every request** on the MCP path needs a bearer token that verifies against the issuer's JWKS, with the **pinned** issuer and audience. That includes `initialize`, `tools/list`, notifications, `GET`, and `DELETE`.
   - The JWKS comes from the discovery `jwks_uri`. Discovery's `issuer` must equal `--issuer`, and the `jwks_uri` must be on the issuer's origin unless you pass `--jwks-uri`.
-  - The JWKS is cached (`--jwks-ttl`, default 300s). A token with an unknown `kid` triggers a refetch, at most once every 10s. A cache past its TTL whose refetch fails denies with `claims_jwks_unavailable`.
+  - The JWKS is cached (`--jwks-ttl`, default 300s, at most 3600s: a key removed from the JWKS stays trusted until the next refresh). A token with an unknown `kid` triggers a refetch, at most once every 10s. A cache past its TTL whose refetch fails denies with `claims_jwks_unavailable`.
   - A token failure gets HTTP 401 with `WWW-Authenticate: Bearer … resource_metadata=…` and a JSON-RPC error.
 - **Introspection** (optional): `--introspection auto` (the discovery `introspection_endpoint`) or a URL. It uses RFC 7662 with `client_secret_basic`, and credentials come only from `S1_INTROSPECTION_CLIENT_ID` / `S1_INTROSPECTION_CLIENT_SECRET`.
   - It is called after the JWT checks pass, on **every request** by default. Caching `active: true` answers is opt-in (see below).
   - `active: false` → `claims_token_revoked`. An unreachable or broken endpoint → `claims_introspection_unavailable`. It fails closed.
-  - **Cache (off by default).** `--introspection-cache-ttl` defaults to `0`: nothing is cached, every request is introspected, and a token revoked at the IdP is denied on the very next request. To enable the cache, pass a positive number of seconds, e.g. `--introspection-cache-ttl 5`. With a TTL set:
+  - **Cache (off by default).** `--introspection-cache-ttl` defaults to `0`: nothing is cached, every request is introspected, and a token revoked at the IdP is denied on the very next request. To enable the cache, pass a positive number of seconds up to `300`, e.g. `--introspection-cache-ttl 5`. Larger values are refused at startup: the TTL is the revocation latency at the proxy, and a huge value (`1e300`) would cache an answer until token `exp`. With a TTL set:
     - Only `active: true` answers are cached. The key is the token's sha256, never the token itself. An entry lives until `min(now + TTL, token exp)`.
     - `active: false`, HTTP errors, timeouts, and malformed answers are **never cached**. Every one of them is re-asked and denied.
     - The cache holds at most 10,000 entries. When full it drops expired entries, then clears itself (a miss only costs one introspection call).
@@ -106,18 +108,45 @@ python -m claims_gate proxy --upstream http://127.0.0.1:3100 \
 - **`tools/call`** runs the claims policy:
   - **deny** → JSON-RPC error `-32050`, `data: {reasonCode, choice, tool, requiredScope}`. Not forwarded.
   - **escalate** (`generate_wallet`) → JSON-RPC error `-32051`, `data: {reasonCode: "claims_wallet_escalate", escalationId, escalationStatus, …}`. Not forwarded. With `--escalation-dir` a human can approve one retry (see [Escalation queue](#escalation-queue)).
-  - **allow** → the request is forwarded byte-for-byte with its headers, including `Authorization` and `Mcp-Session-Id`. The response, including SSE, is streamed back.
+  - **allow** → the request body is forwarded byte-for-byte with its headers, line for line, but never `Mcp-Session-Id` (see below). The `Authorization` sent upstream is exactly the value the proxy verified. The response, including SSE, is streamed back.
+  - Decisions use the JSON-RPC body, which is what kaia-mcp executes. `Mcp-Method` / `Mcp-Name` headers are forwarded unchanged but never trusted.
 - JSON-RPC **batches are rejected** (`claims_malformed_request`), so a batch cannot hide a `tools/call`.
+- **Ambiguous headers are rejected** before the token is checked: HTTP 400, JSON-RPC `-32600`, `claims_malformed_request`, `data.header`, audited as a `deny` and never forwarded. That covers more than one `Authorization`, `Host`, `Content-Length`, `Content-Type`, `Origin`, `Mcp-Method`, `Mcp-Name`, or `MCP-Protocol-Version` line, and a comma-joined `Authorization` value. Otherwise the proxy could verify one token (the first line) while kaia-mcp runs the call with another (the last).
 - **No token is logged.** Each decision is one log line and, with `--audit-log`, one JSON line with `event`, `reasonCode`, `tool`, `subject`, `forwarded`, and a 12-char token fingerprint.
 - `GET /health` and `GET /.well-known/oauth-protected-resource` are served by the proxy itself. The latter points `authorization_servers` at the issuer.
 - The proxy listens with a backlog of 128 (capped by the kernel's `somaxconn`), so a burst of concurrent clients is queued rather than dropped. Each connection is handled on its own thread.
-- **Startup is fail-closed.** Discovery, JWKS, introspection credentials, the escalation queue (if configured), the drift check, and every setting (for example a negative `--drift-interval`) must all pass. Otherwise the proxy prints the reason and exits 3 without listening. After startup, the drift check keeps running (see **Drift guard** above).
+- **Startup is fail-closed.** Discovery, JWKS, introspection credentials, the escalation queue (if configured), the drift check, and every setting must all pass. Every duration needs a finite value **with an upper bound**, because a huge value such as `1e300` behaves like `inf`:
+
+  | Flag | Allowed (seconds) | Why the cap |
+  | --- | --- | --- |
+  | `--drift-interval` | `[0, threading.TIMEOUT_MAX]` (0 = startup only) | larger values overflow the recheck timer |
+  | `--introspection-cache-ttl` | `[0, 300]` | it is the revocation latency at the proxy |
+  | `--jwks-ttl` | `(0, 3600]` | a key removed from the JWKS keeps working until the refresh |
+  | `--escalation-pending-ttl` | `(0, 86400]` | one day of human review; also how long a deny sticks; after it a retry re-asks |
+  | `--escalation-approval-ttl` | `(0, 3600]` | an approval is for the caller's immediate retry |
+
+  The escalation TTLs are checked even without `--escalation-dir`. Otherwise the proxy prints the reason and exits 3 without listening. After startup, the drift check keeps running (see **Drift guard** above).
+
+### Audience and kaia's canonical URL
+
+Since kaia-mcp `00f3511` (naveed949/kaia-mcp#6, RFC 8707), every access token kaia-mcp mints has `aud` = kaia's **canonical URL**: `KAIA_PUBLIC_URL`, or `http://127.0.0.1:<port>` when that is unset. That URL is also kaia's `iss`. So:
+
+- Pin `--audience` to the same URL as `--issuer`, kaia's canonical URL (normalized like kaia does: lowercase scheme and host, no default port, no trailing slash). The old value `kaia-mcp` only matches if kaia-mcp also sets `KAIA_OAUTH_LEGACY_AUDIENCE=kaia-mcp`, which adds it as a second `aud` value. Prefer the canonical URL: it is what kaia itself checks.
+- Clients get tokens from kaia-mcp's authorization server for kaia's canonical URL: either no `resource` parameter, or `resource=<KAIA_PUBLIC_URL>`. kaia-mcp answers `invalid_target` for any other `resource`.
+- **Known gap.** The proxy's own `/.well-known/oauth-protected-resource` names the proxy's URL as `resource` (RFC 9728 requires it to match the URL the client fetched) and kaia's issuer as the authorization server. An RFC 8707 client that follows it asks kaia for `resource=<proxy URL>` and gets `invalid_target`, unless the proxy's public URL *is* kaia's `KAIA_PUBLIC_URL`. Until that topology is decided, configure clients with kaia's canonical URL as the resource.
+
+### Stateless kaia-mcp (MCP 2026-07-28)
+
+- The proxy keeps no session state. kaia-mcp no longer issues `Mcp-Session-Id`, so any id a client sends is stale: the proxy does **not** forward it, and it drops one from upstream responses.
+- `GET` and `DELETE` on the MCP path still need a valid token. They are then forwarded, and kaia-mcp answers `405` (`Allow: POST`), which is relayed as is.
+- Anything kaia-mcp answers after a forward is relayed unchanged: status, headers, and body. That includes its own `403` with `WWW-Authenticate: Bearer error="insufficient_scope", scope=…, resource_metadata=…` (JSON-RPC `-32042`) and its `403` `Origin not allowed`. The proxy forwards the client's `Origin` header, so kaia-mcp's `KAIA_ALLOWED_ORIGINS` decides browser origins.
+- **Why a scope deny at the proxy is not a 403.** The proxy decides `tools/call` before kaia-mcp is asked. A missing scope is a gate deny like any other: HTTP 200, JSON-RPC `-32050`, `reasonCode: claims_insufficient_scope`, `requiredScope`. That keeps one deny shape for all gate reasons (scope, drift, escalation, unknown tool) and keeps the existing `-32050` contract. kaia-mcp's own `403` therefore only reaches a client if kaia's policy is stricter than the gate's, which the drift guard is there to prevent. The proxy's token failures stay HTTP 401 with its own `WWW-Authenticate` challenge, as before.
 
 ### Escalation queue
 
 Without `--escalation-dir` (or `S1_ESCALATION_DIR`) an escalation is terminal: `-32051` with a random `escalationId` and `escalationStatus: "not_queued"`, and nothing can approve it.
 
-With it, the proxy records every escalation in `<dir>/escalations.sqlite3` (dir mode `700`, file `600`). If the file (or the directory) is deleted while the proxy runs, the next queue access recreates it empty with the same modes, whatever the process umask; nothing approved survives, so the next escalation is a fresh `pending` request. One row per request:
+With it, the proxy records every escalation in `<dir>/escalations.sqlite3` (dir mode `700`, file `600`). If the file (or the directory) is deleted while the proxy runs, the next queue access recreates it empty with the same modes, whatever the process umask (sqlite opens it read-write only and never creates it itself). Nothing approved survives, so the next escalation is a fresh `pending` request. Every queue transaction first runs `CREATE TABLE IF NOT EXISTS`, so requests racing that recreation escalate normally (one shared `pending` row) instead of failing with `claims_escalation_unavailable`. A request that races the deletion itself (the file vanishes between the proxy's check and sqlite opening it) still fails closed with `claims_escalation_unavailable`; its retry escalates normally. One row per request:
 
 | Field | Meaning |
 | --- | --- |
@@ -129,7 +158,7 @@ With it, the proxy records every escalation in `<dir>/escalations.sqlite3` (dir 
 | `status` | `pending` → `approved` → `consumed`, or `denied`, or `expired` |
 | `createdAt`, `decidedAt`, `consumedAt` | unix seconds |
 | `expiresAt` | pending: decide before this; approved: retry before this; denied: identical retries denied until this |
-| `pendingTtl`, `approvalTtl` | fixed by the proxy when the row is created (`--escalation-pending-ttl`, default 3600s; `--escalation-approval-ttl`, default 300s) |
+| `pendingTtl`, `approvalTtl` | fixed by the proxy when the row is created (`--escalation-pending-ttl`, default 3600s, max 86400s; `--escalation-approval-ttl`, default 300s, max 3600s) |
 
 ```bash
 python -m claims_gate escalations list [--status pending] --dir /var/lib/s1/escalations
@@ -158,6 +187,7 @@ Approval only turns an *escalate* into one allow. The claims policy runs first, 
 - `generate_wallet` is escalated, queued as `pending`, and never forwarded.
   - After `escalations approve <id>`, exactly one identical retry reaches kaia-mcp. kaia-mcp itself still refuses it (`tool_disabled`). The next retry is escalated again with a new id.
   - After `escalations deny <id>`, the identical retry gets `claims_escalation_denied`.
+- `initialize` through the proxy succeeds with no `Mcp-Session-Id` (stateless kaia-mcp), with the proxy's `--audience` pinned to kaia's canonical URL.
 - Forged, wrong-audience, and expired tokens are denied.
 - A token revoked at kaia-mcp still verifies offline, yet with the default settings the proxy denies it with `claims_token_revoked` on the very next request, without forwarding it.
 - A separate proxy that opts in with `--introspection-cache-ttl 3` forwards the revoked token only while its cache entry lives, and kaia-mcp refuses it on its own. After the TTL that proxy denies it with `claims_token_revoked` every time.
@@ -178,7 +208,7 @@ python packages/claims-gate/e2e/live_kaia.py --evidence-dir /tmp/s1-live [--kaia
 ```python
 from claims_gate import ClaimsGate, VerifierConfig, kaia_policy, combine
 
-gate = ClaimsGate(VerifierConfig(jwks=jwks, issuer=ISSUER, audience="kaia-mcp"), kaia_policy())
+gate = ClaimsGate(VerifierConfig(jwks=jwks, issuer=ISSUER, audience=KAIA_CANONICAL_URL), kaia_policy())
 result = gate.evaluate(request.headers.get("Authorization"), tool_name)
 decision = combine(result.decision, nimble_decision)  # claims are the ceiling; Nimble can only narrow
 seam.enforce(decision, tool_request, granted_authority)

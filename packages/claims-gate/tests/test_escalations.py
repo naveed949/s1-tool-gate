@@ -179,8 +179,15 @@ def _race(store_dir: Path, barrier: Any, results: Any) -> None:
 def widen_race(monkeypatch: pytest.MonkeyPatch) -> None:
     """Sleep between reading the approved row and updating it, so racing retries overlap.
 
-    Without this the transactions are too short to interleave reliably and a broken
-    lock (deferred BEGIN) would go unnoticed.
+    Without the sleep the transactions are too short to interleave reliably. What the
+    two tests below then catch: dropping the transaction *and* the guarded consume
+    together (no transaction at all, plus an unguarded UPDATE) lets more than one
+    retry through. They do not prove ``BEGIN IMMEDIATE`` on its own is needed: with a
+    deferred ``BEGIN`` (guarded or not) one retry is allowed and the others fail with
+    ``database is locked``, which the proxy turns into a deny, never a second allow.
+    Both claims are pinned by ``test_widen_race_mutations_behave_as_documented``; the
+    status guard plus rowcount check is pinned separately by
+    ``test_consume_requires_exactly_one_row_updated``.
     """
     import time as _time
 
@@ -240,6 +247,62 @@ def test_concurrent_identical_retries_processes_consume_one_approval(tmp_path: P
         p.join(timeout=30)
         assert p.exitcode == 0
     _assert_one_allow(d, eid, actions)
+
+
+class _MutatedDb:
+    """sqlite connection whose SQL is rewritten: deferred or no transaction, unguarded consume."""
+
+    def __init__(self, db: Any, mode: str) -> None:
+        self._db, self._mode = db, mode
+
+    def execute(self, sql: str, params: Any = ()) -> Any:
+        stmt = sql.strip()
+        if stmt.startswith("UPDATE escalations SET status = 'consumed'"):
+            sql, params = "UPDATE escalations SET status = 'consumed', consumed_at = ? WHERE id = ?", params[:2]
+        elif stmt in ("BEGIN IMMEDIATE", "COMMIT", "ROLLBACK") and self._mode == "no-transaction":
+            sql, params = "SELECT 1", ()
+        elif stmt == "BEGIN IMMEDIATE":
+            sql = "BEGIN"
+        return self._db.execute(sql, params)
+
+    def close(self) -> None:
+        self._db.close()
+
+
+@pytest.mark.parametrize("mode", ["deferred-unguarded", "no-transaction"])
+def test_widen_race_mutations_behave_as_documented(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, widen_race: None, mode: str) -> None:
+    """What the widen_race docstring says about weaker variants, measured.
+
+    deferred BEGIN + unguarded consume: one allow, the rest 'database is locked'
+    (the proxy denies those), never two allows. No transaction + unguarded consume:
+    more than one allow, which is what the concurrent-retry tests exist to catch.
+    """
+    import queue
+    import sqlite3
+    import threading
+
+    d = tmp_path / "esc"
+    s = EscalationStore(d)
+    eid = s.on_escalate("alice", "generate_wallet", H, "claims_wallet_escalate").escalation.id
+    s.approve(eid)
+    real_connect = sqlite3.connect
+    monkeypatch.setattr(sqlite3, "connect", lambda *a, **kw: _MutatedDb(real_connect(*a, **kw), mode))
+    barrier = threading.Barrier(N_RETRIES)
+    results: queue.Queue[str] = queue.Queue()
+    threads = [threading.Thread(target=_race, args=(d, barrier, results)) for _ in range(N_RETRIES)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    actions = [results.get_nowait() for _ in range(N_RETRIES)]
+    allows = actions.count("allow")
+    if mode == "deferred-unguarded":
+        assert allows == 1, actions
+        others = [a for a in actions if a != "allow"]
+        assert set(others) <= {"escalate", "error:OperationalError:database is locked"}, actions
+        assert "error:OperationalError:database is locked" in others, actions
+    else:
+        assert allows > 1, actions
 
 
 def test_consume_requires_exactly_one_row_updated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -325,3 +388,97 @@ def test_db_deleted_at_runtime_is_recreated_private(tmp_path: Path, remove: str)
     assert stat.S_IMODE(s.path.stat().st_mode) == 0o600
     assert stat.S_IMODE(s.directory.stat().st_mode) == 0o700
     assert [e.id for e in s.list()] == [out.escalation.id]
+
+
+# ---- db recreated at runtime: racing requests escalate, never error or allow ---
+
+
+def test_schema_is_ensured_inside_every_transaction(tmp_path: Path) -> None:
+    """Another request created the (empty) db file but has not made the table yet.
+
+    This is the state a racing request sees right after a runtime deletion: the file
+    exists, so the old code skipped the schema and failed with 'no such table'.
+    """
+    import os
+
+    clock = Clock()
+    s = store(tmp_path, clock)
+    e = s.on_escalate("alice", "generate_wallet", H, "r").escalation
+    s.approve(e.id)
+    s.path.unlink()
+    fd = os.open(s.path, os.O_CREAT | os.O_WRONLY, 0o600)  # what _create_private leaves behind
+    os.close(fd)
+    out = s.on_escalate("alice", "generate_wallet", H, "r")
+    assert out.action == "escalate" and out.escalation.status == "pending"  # the old approval is gone
+    assert [r.status for r in s.list()] == ["pending"]
+
+
+def test_db_vanishing_before_connect_fails_closed_without_a_umask_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """sqlite must never create the db itself (it would use the umask): it errors, the proxy denies."""
+    import sqlite3
+
+    s = store(tmp_path, Clock())
+    s.path.unlink()
+    monkeypatch.setattr(s, "_create_private", lambda: False)  # file deleted after the existence check
+    with pytest.raises(sqlite3.OperationalError):
+        s.on_escalate("alice", "generate_wallet", H, "r")
+    assert not s.path.exists()
+
+
+DELETE_RACE_TRIALS = 20
+
+
+def test_db_deleted_at_runtime_concurrent_retries_all_escalate(tmp_path: Path) -> None:
+    """Repro of the round-2 finding: 12 racing retries right after the db is deleted.
+
+    Every one must escalate (no 'no such table' -> claims_escalation_unavailable),
+    they share exactly one fresh pending row, and the deleted approval never allows.
+    """
+    import threading
+
+    outcomes: list[str] = []
+    for trial in range(DELETE_RACE_TRIALS):
+        s = EscalationStore(tmp_path / f"q{trial}")
+        e = s.on_escalate("alice", "generate_wallet", H, "r").escalation
+        s.approve(e.id)
+        s.path.unlink()
+        barrier = threading.Barrier(N_RETRIES)
+        res: list[str] = []
+        lock = threading.Lock()
+
+        def one(s: EscalationStore = s, barrier: threading.Barrier = barrier, res: list[str] = res) -> None:
+            barrier.wait(timeout=30)
+            try:
+                action = s.on_escalate("alice", "generate_wallet", H, "r").action
+            except Exception as err:  # noqa: BLE001 - surfaced as a non-action result
+                action = f"error:{type(err).__name__}:{err}"
+            with lock:
+                res.append(action)
+
+        threads = [threading.Thread(target=one) for _ in range(N_RETRIES)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        outcomes += res
+        assert [r.status for r in s.list()] == ["pending"], (trial, [(r.id, r.status) for r in s.list()])
+        assert stat.S_IMODE(s.path.stat().st_mode) == 0o600
+    assert outcomes == ["escalate"] * (DELETE_RACE_TRIALS * N_RETRIES), sorted(set(outcomes))
+
+
+@pytest.mark.parametrize("ttl", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0, 1e300, 9e18])
+def test_escalation_ttls_must_be_finite_and_positive(tmp_path: Path, ttl: float) -> None:
+    with pytest.raises(ValueError):
+        EscalationStore(tmp_path / "a", pending_ttl=ttl)
+    with pytest.raises(ValueError):
+        EscalationStore(tmp_path / "b", approval_ttl=ttl)
+
+
+def test_escalation_ttls_have_an_upper_bound(tmp_path: Path) -> None:
+    """A huge finite TTL is a pending/deny/approval that never expires in practice."""
+    with pytest.raises(ValueError, match=r"pending TTL must be a finite number in \(0, 86400"):
+        EscalationStore(tmp_path / "a", pending_ttl=86400.001)
+    with pytest.raises(ValueError, match=r"approval TTL must be a finite number in \(0, 3600"):
+        EscalationStore(tmp_path / "b", approval_ttl=3600.001)
+    s = EscalationStore(tmp_path / "c", pending_ttl=86400.0, approval_ttl=3600.0)
+    assert (s.pending_ttl, s.approval_ttl) == (86400.0, 3600.0)

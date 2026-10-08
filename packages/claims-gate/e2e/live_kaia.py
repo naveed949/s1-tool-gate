@@ -4,7 +4,8 @@
 Starts kaia-mcp (pinned commit, or a local checkout), starts the proxy, logs in
 with the device flow against kaia-mcp's demo IdP, and proves:
 
-  initialize-through-proxy   MCP initialize through the proxy; Mcp-Session-Id passed through
+  initialize-through-proxy   MCP initialize through the proxy; stateless kaia-mcp: no Mcp-Session-Id
+                             (the proxy pins --audience to kaia's canonical URL, the token aud)
   encode-denied              encode_function_data without kaia:encode denied at the proxy
                              (claims_insufficient_scope); kaia-mcp logs no Tool call for it
   wallet-escalated           generate_wallet escalated (-32051) with a queued escalationId, never forwarded
@@ -71,9 +72,12 @@ from claims_gate.kaia import KAIA_TOOL_SCOPES
 from claims_gate.verify import VerifiedClaims, VerifierConfig, verify_access_token
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-# kaia-mcp commit that first ships JWT access tokens, JWKS, introspection, and the
-# tool-scopes metadata (naveed949/kaia-mcp#3, squash-merge commit on main).
-DEFAULT_KAIA_REF = "253d6c88c989019759449b5fbde44ae98ab49096"
+# kaia-mcp main after naveed949/kaia-mcp#6 (squash-merge commit): stateless MCP
+# 2026-07-28 (no Mcp-Session-Id, GET/DELETE 405), RFC 8707 audience = kaia's
+# canonical URL (KAIA_PUBLIC_URL, here http://127.0.0.1:<port>), 403
+# insufficient_scope, per-process revocation-file lock. The tool -> scope map is
+# unchanged since 253d6c8 (#3, first JWT/JWKS/introspection/tool-scopes release).
+DEFAULT_KAIA_REF = "00f35117858a583049ca048d5a12e4d09ed83e85"
 DEFAULT_KAIA_REPO = "https://github.com/naveed949/kaia-mcp.git"
 INTROSPECTION_CLIENT_ID = "s1-tool-gate"
 DEFAULT_KAIA_RPC = "https://public-en.node.kaia.io"
@@ -286,10 +290,10 @@ def prepare_kaia(args: argparse.Namespace, work: Path, run_log: Path) -> tuple[P
     return kaia, rev + ("+dirty" if dirty else "")
 
 
-def start_proxy(r: Run, name: str, kaia_url: str, *, audience: str = "kaia-mcp", extra: list[str] | None = None, env_extra: dict[str, str] | None = None, expect_ready: bool = True) -> tuple[str, subprocess.Popen[Any], Path]:
+def start_proxy(r: Run, name: str, kaia_url: str, *, audience: str | None = None, extra: list[str] | None = None, env_extra: dict[str, str] | None = None, expect_ready: bool = True) -> tuple[str, subprocess.Popen[Any], Path]:
     port = free_port()
     logfile = r.evidence / f"proxy-{name}.log"
-    cmd = [sys.executable, "-m", "claims_gate", "proxy", "--upstream", kaia_url, "--issuer", kaia_url, "--audience", audience, "--port", str(port), "--audit-log", str(r.evidence / f"audit-{name}.jsonl"), *(extra or [])]
+    cmd = [sys.executable, "-m", "claims_gate", "proxy", "--upstream", kaia_url, "--issuer", kaia_url, "--audience", audience or kaia_url, "--port", str(port), "--audit-log", str(r.evidence / f"audit-{name}.jsonl"), *(extra or [])]
     env = {**os.environ, **(env_extra or {})}
     p = r.spawn(cmd, cwd=Path.cwd(), env=env, logfile=logfile)
     url = f"http://127.0.0.1:{port}/"
@@ -419,7 +423,10 @@ def main() -> int:
 
         mcp = Mcp(proxy_url, access)
         st, body = mcp.initialize()
-        r.check("initialize-through-proxy", st == 200 and bool(mcp.session), status=st, sessionIdForwarded=bool(mcp.session))
+        # kaia-mcp >= 00f3511 never sends Mcp-Session-Id, so "no session" here shows the
+        # stateless path works end to end; it cannot catch the proxy *relaying* one.
+        # That is pinned offline (test_allow_forwards_body_and_auth_unchanged_without_a_session).
+        r.check("initialize-through-proxy", st == 200 and not mcp.session, status=st, sessionId=bool(mcp.session))
 
         st, body = mcp.call("encode_function_data", BALANCE_OF_ARGS)
         r.check("encode-denied", st == 200 and body["error"]["code"] == -32050 and reason(body) == "claims_insufficient_scope" and tool_calls(kaia_log, "encode_function_data") == 0, status=st, error=body.get("error"), kaiaToolCallLines=tool_calls(kaia_log, "encode_function_data"))
@@ -488,7 +495,7 @@ def main() -> int:
         st_before, _ = Mcp(proxy_url, t2["access_token"]).initialize()
         rv_status, _ = form(kaia_url + "/oauth/revoke", {"token": t2["access_token"]})
         _, _, jwks_raw = request("GET", kaia_url + "/oauth/jwks")
-        offline = verify_access_token(t2["access_token"], VerifierConfig(jwks=json.loads(jwks_raw), issuer=kaia_url, audience="kaia-mcp"))
+        offline = verify_access_token(t2["access_token"], VerifierConfig(jwks=json.loads(jwks_raw), issuer=kaia_url, audience=kaia_url))
         audit_main = evidence / "audit-main.jsonl"
         audit_lines_before = len(audit_main.read_text().splitlines())
         st, body = Mcp(proxy_url, t2["access_token"]).initialize()
