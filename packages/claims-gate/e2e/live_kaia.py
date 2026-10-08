@@ -17,8 +17,10 @@ with the device flow against kaia-mcp's demo IdP, and proves:
                              body with a harmless Mcp-Name is denied at the proxy (not forwarded);
                              an allowed body with a mismatching Mcp-Name is forwarded with the
                              header as sent and kaia refuses it (400 -32020 HeaderMismatch, relayed)
-  header-hardening-tap       raw TCP tap between a proxy and kaia: obs-fold, CR/LF, control chars,
-                             malformed lines, TE+CL, non-digit Content-Length, and Connection naming
+  header-hardening-tap       raw TCP tap between a proxy and kaia: obs-fold, CR/LF, bare CR
+                             (including a line ending `\r\r\n` that would hide later headers, a
+                             lone `\r` line, and `a\rName: v`), control chars, malformed lines /
+                             non-token names, TE+CL, non-digit Content-Length, and Connection naming
                              Authorization are refused (400 claims_malformed_request) with 0 bytes
                              reaching kaia; a request whose Connection lists X-Nominated reaches
                              kaia without X-Nominated/Proxy-Connection and with exactly the one
@@ -119,9 +121,13 @@ def log(msg: str) -> None:
 
 
 def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
+    while True:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = int(s.getsockname()[1])
+        # Never reuse the reserved demo port; retry on the rare collision.
+        if port != 41777:
+            return port
 
 
 def run(cmd: list[str], cwd: Path, logfile: Path) -> None:
@@ -395,6 +401,16 @@ TAP_REFUSED: list[tuple[str, list[bytes], bool]] = [
     ("te-plus-cl", [b"Authorization: Bearer {tok}", b"Transfer-Encoding: chunked"], True),
     ("content-length-plus-sign", [b"Authorization: Bearer {tok}", b"Content-Length: +{n}"], False),
     ("connection-lists-authorization", [b"Authorization: Bearer {tok}", b"Connection: Authorization"], True),
+    # M1: the stdlib parser splits a line on a bare CR. Content-Length is sent first so the
+    # unfixed proxy would still read the body and kaia would execute the call.
+    ("bare-cr-hides-second-authorization", [b"Authorization: Bearer {tok}", b"Content-Length: {n}", b"X-Probe: a\r", b"Authorization: Bearer {read}"], False),
+    ("bare-cr-hides-transfer-encoding", [b"Authorization: Bearer {tok}", b"Content-Length: {n}", b"X-Probe: a\r", b"Transfer-Encoding: chunked"], False),
+    ("bare-cr-hides-origin", [b"Authorization: Bearer {tok}", b"Content-Length: {n}", b"X-Probe: a\r", b"Origin: http://evil.example"], False),
+    ("bare-cr-hides-folded-auth", [b"Authorization: Bearer {tok}", b"Content-Length: {n}", b"X-Probe: a\r", b" Authorization: Bearer {read}"], False),
+    ("lone-cr-line-hides-rest", [b"Authorization: Bearer {tok}", b"Content-Length: {n}", b"\r", b"Authorization: Bearer {read}", b"Connection: Authorization"], False),
+    ("auth-value-cr-then-crlf", [b"Content-Length: {n}", b"Authorization: Bearer {tok}\r", b"Authorization: Bearer {read}"], False),
+    ("bare-cr-mid-value-splits-header", [b"Authorization: Bearer {tok}", b"Content-Length: {n}", b"X-Probe: a\rX-Other: b"], False),
+    ("bare-cr-mid-value-supplies-auth", [b"Content-Length: {n}", b"X-Probe: a\rAuthorization: Bearer {tok}"], False),
 ]
 
 

@@ -1248,8 +1248,17 @@ _REFUSED_RAW = [
     ("whitespace-before-colon", [b"X-A : 1"], True, True, "header-block"),
     ("leading-whitespace-first-line", None, True, True, "header-block"),
     ("bare-cr-in-value", [b"X-A: a\rb"], True, True, "header-block"),
+    ("bare-lf-obs-fold", [b"X-Probe: a\n Authorization: Bearer {read}"], True, True, "X-Probe"),
+    ("non-token-header-name", [b"X(y): z"], True, True, "header-block"),
+    ("non-token-header-name-slash", [b"X/y: z"], True, True, "header-block"),
+    ("non-token-header-name-quote", [b'X"y: z'], True, True, "header-block"),
+    ("non-token-header-name-braces", [b"{x}: z"], True, True, "header-block"),
     ("te-chunked-plus-content-length", [b"Transfer-Encoding: chunked"], True, True, "Transfer-Encoding"),
     ("te-gzip-chunked-plus-content-length", [b"Transfer-Encoding: gzip, chunked"], True, True, "Transfer-Encoding"),
+    ("te-identity-plus-content-length", [b"Transfer-Encoding: identity"], True, True, "Transfer-Encoding"),
+    ("te-gzip-plus-content-length", [b"Transfer-Encoding: gzip"], True, True, "Transfer-Encoding"),
+    ("te-empty-plus-content-length", [b"Transfer-Encoding:"], True, True, "Transfer-Encoding"),
+    ("content-length-empty", [b"Content-Length:"], True, False, "Content-Length"),
     ("content-length-plus-sign", [b"Content-Length: +{n}"], True, False, "Content-Length"),
     ("content-length-underscores", [b"Content-Length: {n_}"], True, False, "Content-Length"),
     ("content-length-trailing-space", [b"Content-Length: {n} "], True, False, "Content-Length"),
@@ -1265,10 +1274,14 @@ def _refused_detail(case: str) -> str:
     """The message fragment each case must be refused with (which check fired, not just that one did)."""
     if case in ("bearer-with-nbsp", "bearer-with-nel"):
         return "non-ASCII byte"
-    if case in ("whitespace-before-colon", "leading-whitespace-first-line", "bare-cr-in-value"):
+    if case in ("whitespace-before-colon", "leading-whitespace-first-line"):
         return "malformed header line"
+    if case == "bare-cr-in-value":
+        return "bare CR in a header line"
     prefixes = {
         "obs-fold": "obs-fold or CR/LF",
+        "bare-lf-obs-fold": "obs-fold or CR/LF",
+        "non-token-header-name": "header name is not an RFC 9110 token",
         "whitespace-only": "obs-fold or CR/LF",
         "fold-": "obs-fold or CR/LF",
         "bearer-": "control character",
@@ -1379,3 +1392,232 @@ def test_transfer_encoding_alone_is_never_forwarded(rig_factory: Any) -> None:
     status, data = _send_raw(rig.proxy_port, _raw_post_bytes(tok, [b"Transfer-Encoding: chunked"], chunked, length=False))
     assert (status, _err(data)["data"]["reasonCode"]) == (400, "claims_malformed_request"), data
     assert tap.raw() == [] and rig.fake.mcp_requests == []
+
+
+# ---- bare CR: the stdlib email parser splits a header line on a lone CR ---------
+#
+# "X: a\r\r\n" (or a line that is just "\r") makes the parser end the header block early with
+# no defect: every later line lands in headers.get_payload(), unchecked and unforwarded.
+# "X: a\rName: v" becomes two headers. An RFC 9112 2.2 parser (reject, or read the CR as SP)
+# sees a different header set, so the gate refuses any raw header line with a CR left in it.
+
+
+def _raw_head(lines: list[bytes], body: bytes, *, method: bytes = b"POST") -> bytes:
+    return method + b" / HTTP/1.1\r\n" + b"\r\n".join(lines) + b"\r\n\r\n" + body
+
+
+def _bare_cr_cases(tok: str, other: str) -> dict[str, list[bytes]]:
+    """The review's 8 variants (S3 M1) plus edge forms. Content-Length comes first, so the
+    unfixed proxy reads the whole body and the request is one kaia would execute."""
+    auth, oth = b"Authorization: Bearer " + tok.encode(), b"Authorization: Bearer " + other.encode()
+    pre = [b"Host: 127.0.0.1", b"Content-Type: application/json", b"Accept: application/json, text/event-stream", b"Content-Length: " + str(len(_BODY)).encode()]
+    return {
+        "crcrlf-hides-second-authorization": pre + [auth, b"X-Probe: a\r", oth],
+        "crcrlf-hides-transfer-encoding": pre + [auth, b"X-Probe: a\r", b"Transfer-Encoding: chunked"],
+        "crcrlf-hides-origin": pre + [auth, b"X-Probe: a\r", b"Origin: http://evil.example"],
+        "crcrlf-hides-folded-auth": pre + [auth, b"X-Probe: a\r", b" " + oth],
+        "lone-cr-line-hides-rest": pre + [auth, b"\r", oth, b"Connection: Authorization"],
+        "auth-value-cr-then-crlf": pre + [auth + b"\r", oth],
+        "bare-cr-mid-value-splits-header": pre + [auth, b"X-Probe: a\rX-Other: b"],
+        "bare-cr-mid-value-supplies-auth": pre + [b"X-Probe: a\r" + auth],
+        # edge forms
+        "crcrlf-on-last-line": pre + [auth, b"X-Probe: a\r"],
+        "lone-cr-line-last": pre + [auth, b"\r"],
+        "lone-cr-line-first": [b"\r", *pre, auth],
+        "cr-at-line-start": pre + [auth, b"\rX-Probe: a"],
+        "cr-lf-only-line-endings-mixed": pre + [auth, b"X-Probe: a\r\n\r"],
+    }
+
+
+_BARE_CR_IDS = list(_bare_cr_cases("t", "o"))
+
+
+@pytest.mark.parametrize("case", _BARE_CR_IDS)
+def test_bare_cr_header_blocks_are_refused_and_never_reach_upstream(rig_factory: Any, case: str) -> None:
+    tap = RawTap()
+    rig = rig_factory(tap=tap)
+    tok, other = rig.token("kaia:read kaia:encode"), rig.token("kaia:read")
+    status, data = _send_raw(rig.proxy_port, _raw_head(_bare_cr_cases(tok, other)[case], _BODY))
+    err = _err(data)
+    assert (status, err["code"], err["data"]["reasonCode"], err["data"]["choice"], err["data"]["header"]) == (400, -32600, "claims_malformed_request", "deny", "header-block"), data
+    assert "bare CR in a header line" in err["message"], err["message"]
+    assert rig.fake.mcp_requests == []
+    assert tap.raw() == [], tap.raw()
+    assert [(a["event"], a["stage"], a["forwarded"], a["header"]) for a in rig.audit] == [("deny", "request", False, "header-block")]
+    assert not any(t in json.dumps(rig.audit) or t.encode() in data for t in (tok, other))
+
+
+@pytest.mark.parametrize("method", [b"GET", b"DELETE"])
+def test_bare_cr_is_refused_on_get_and_delete(rig_factory: Any, method: bytes) -> None:
+    tap = RawTap()
+    rig = rig_factory(tap=tap)
+    tok = rig.token("kaia:read")
+    status, data = _send_raw(rig.proxy_port, _raw_head([b"Host: 127.0.0.1", b"Authorization: Bearer " + tok.encode(), b"X-Probe: a\r", b"Origin: http://evil.example"], b"", method=method))
+    err = _err(data)
+    assert (status, err["data"]["reasonCode"], err["data"]["header"]) == (400, "claims_malformed_request", "header-block"), data
+    assert tap.raw() == [] and rig.fake.mcp_requests == []
+
+
+def test_bare_cr_in_the_request_line_is_refused(rig_factory: Any) -> None:
+    """The stdlib strips every trailing CR/LF from the request line; another parser may not."""
+    tap = RawTap()
+    rig = rig_factory(tap=tap)
+    tok = rig.token("kaia:read")
+    raw = _raw_post_bytes(tok, [], _BODY).replace(b" HTTP/1.1\r\n", b" HTTP/1.1\r\r\n", 1)
+    status, data = _send_raw(rig.proxy_port, raw)
+    err = _err(data)
+    assert (status, err["data"]["reasonCode"], err["data"]["header"]) == (400, "claims_malformed_request", "request-line"), data
+    assert "bare CR in the request line" in err["message"]
+    assert tap.raw() == [] and rig.fake.mcp_requests == []
+
+
+def test_bare_lf_line_endings_are_still_accepted(rig_factory: Any) -> None:
+    """RFC 9112 2.2 lets a recipient accept a bare LF line terminator; only a CR left inside a line is refused."""
+    rig = rig_factory()
+    tok = rig.token("kaia:read")
+    raw = _raw_post_bytes(tok, [b"X-Probe: a"], _BODY).replace(b"\r\n", b"\n")
+    status, data = _send_raw(rig.proxy_port, raw)
+    assert status == 200, data
+    [seen] = rig.fake.mcp_requests
+    assert seen["headers"]["X-Probe"] == "a" and seen["body"] == _BODY
+
+
+def test_every_byte_glued_into_a_value_either_is_refused_or_stays_one_header(rig_factory: Any) -> None:
+    """Sweep: "X-Probe: a<byte>X-Smuggled: v". Either 400 before forwarding, or forwarded with
+    no X-Smuggled header (the parser did not split the line). LF is a line terminator (allowed)."""
+    tap = RawTap()
+    rig = rig_factory(tap=tap)
+    tok = rig.token("kaia:read")
+    refused, kept = [], []
+    for b in range(256):
+        if b == 0x0A:
+            continue
+        line = b"X-Probe: a" + bytes([b]) + b"X-Smuggled: v"
+        status, data = _send_raw(rig.proxy_port, _raw_post_bytes(tok, [line], _BODY))
+        (refused if status == 400 else kept).append(b)
+        if status != 400:
+            assert status == 200, (b, data)
+    for raw in tap.raw():
+        head = raw.split(b"\r\n\r\n", 1)[0].lower()
+        assert b"\r\nx-smuggled:" not in head, raw
+    assert 0x0D in refused and all(c in refused for c in range(0x20) if c not in (0x09, 0x0A)) and 0x7F in refused
+    assert len(rig.fake.mcp_requests) == len(kept) == len(tap.raw())
+
+
+# ---- L1 (S3 review): the checks run for every method and every auth-relevant header
+
+
+_GET_DELETE_REFUSED = [
+    ("obs-fold", [b"X-Probe: a", b" Authorization: Bearer {read}"], "X-Probe", "obs-fold or CR/LF"),
+    ("control-char-in-bearer", None, "Authorization", "control character"),
+    ("non-ascii-mcp-name", [b"Mcp-Name: get_block_number\xa0"], "Mcp-Name", "non-ASCII byte"),
+    ("content-length-plus-sign", [b"Content-Length: +0"], "Content-Length", "not plain ASCII digits"),
+    ("content-length-empty", [b"Content-Length:"], "Content-Length", "not plain ASCII digits"),
+    ("te-plus-cl", [b"Transfer-Encoding: chunked", b"Content-Length: 0"], "Transfer-Encoding", "both Transfer-Encoding and Content-Length"),
+]
+
+
+@pytest.mark.parametrize("method", [b"GET", b"DELETE"])
+@pytest.mark.parametrize(("case", "lines", "header", "detail"), _GET_DELETE_REFUSED, ids=[c[0] for c in _GET_DELETE_REFUSED])
+def test_header_value_and_framing_checks_run_on_get_and_delete(rig_factory: Any, method: bytes, case: str, lines: list[bytes] | None, header: str, detail: str) -> None:
+    tap = RawTap()
+    rig = rig_factory(tap=tap)
+    tok, read = rig.token("kaia:read"), rig.token("kaia:read")
+    head = [b"Host: 127.0.0.1"]
+    if lines is None:
+        head.append(b"Authorization: Bearer \x1c" + tok.encode())
+    else:
+        head.append(b"Authorization: Bearer " + tok.encode())
+        head += [ln.replace(b"{read}", read.encode()) for ln in lines]
+    status, data = _send_raw(rig.proxy_port, _raw_head(head, b"", method=method))
+    err = _err(data)
+    assert (status, err["code"], err["data"]["reasonCode"], err["data"]["header"]) == (400, -32600, "claims_malformed_request", header), data
+    assert detail in err["message"], err["message"]
+    assert tap.raw() == [] and rig.fake.mcp_requests == []
+    assert [(a["event"], a["stage"], a["forwarded"], a["httpMethod"]) for a in rig.audit] == [("deny", "request", False, method.decode())]
+
+
+_NON_ASCII_VALUES = {
+    "Authorization": b"Bearer {tok}\xe9",
+    "Host": b"127.0.0.1\xe9",
+    "Content-Length": b"\xd9\xa3",  # Arabic-Indic digit three, UTF-8
+    "Content-Type": b"application/json; x=\xe9",
+    "Origin": b"http://\xe9.example",
+    "Mcp-Method": b"tools/call\xa0",
+    "Mcp-Name": b"get_block_number\x85",
+    "MCP-Protocol-Version": b"2026-07-28\xa0",
+}
+
+
+@pytest.mark.parametrize("name", list(_NON_ASCII_VALUES))
+def test_non_ascii_is_refused_in_each_auth_relevant_header(rig_factory: Any, name: str) -> None:
+    tap = RawTap()
+    rig = rig_factory(tap=tap)
+    tok = rig.token("kaia:read")
+    base = {"Host": b"127.0.0.1", "Content-Type": b"application/json", "Authorization": b"Bearer " + tok.encode(), "Content-Length": str(len(_BODY)).encode()}
+    base[name] = _NON_ASCII_VALUES[name].replace(b"{tok}", tok.encode())
+    status, data = _send_raw(rig.proxy_port, _raw_head([k.encode() + b": " + v for k, v in base.items()], _BODY))
+    err = _err(data)
+    assert (status, err["data"]["reasonCode"], err["data"]["header"]) == (400, "claims_malformed_request", name), data
+    assert f"non-ASCII byte in {name}" in err["message"], err["message"]
+    assert tap.raw() == [] and rig.fake.mcp_requests == []
+
+
+@pytest.mark.parametrize("position", ["first", "middle", "last"])
+@pytest.mark.parametrize("named", ["Authorization", "mcp-name"])
+def test_connection_naming_an_auth_header_is_refused_on_any_connection_line(rig_factory: Any, position: str, named: str) -> None:
+    tap = RawTap()
+    rig = rig_factory(tap=tap)
+    tok = rig.token("kaia:read")
+    conns = [b"Connection: keep-alive", b"Connection: X-Unrelated", b"Connection: X-Other"]
+    conns[{"first": 0, "middle": 1, "last": 2}[position]] = b"Connection: X-A, " + named.encode()
+    status, data = _send_raw(rig.proxy_port, _raw_post_bytes(tok, conns, _BODY))
+    err = _err(data)
+    assert (status, err["data"]["reasonCode"], err["data"]["header"]) == (400, "claims_malformed_request", "Connection"), data
+    assert "Connection lists the" in err["message"]
+    assert tap.raw() == [] and rig.fake.mcp_requests == []
+
+
+def test_headers_named_on_any_upstream_connection_line_are_dropped_from_responses(rig_factory: Any) -> None:
+    fake = FakeKaia(signer=TestSigner.generate(kid="kid-1"))
+    fake.canned = (
+        200,
+        [("Content-Type", "application/json"), ("Connection", "X-Hop-A"), ("Connection", "keep-alive, X-Hop-B"), ("Connection", "x-hop-c"),
+         ("X-Hop-A", "1"), ("X-Hop-B", "2"), ("X-Hop-C", "3"), ("X-End", "kept")],
+        b'{"jsonrpc":"2.0","id":1,"result":{}}',
+    )
+    rig = rig_factory(fake=fake)
+    status, headers, _ = rig.post(CALL("get_block_number"), rig.token("kaia:read"))
+    assert status == 200
+    assert not {"x-hop-a", "x-hop-b", "x-hop-c"} & set(headers), headers
+    assert headers["x-end"] == "kept"
+
+
+# ---- NIT: client forwarding headers stop at the gate ----------------------------
+
+
+def test_client_forwarded_headers_are_not_forwarded(rig_factory: Any) -> None:
+    """kaia-mcp trusts none of them, and the gate adds none: a client cannot plant them for a later hop."""
+    tap = RawTap()
+    rig = rig_factory(tap=tap)
+    tok = rig.token("kaia:read")
+    lines = [b"X-Forwarded-For: 10.0.0.1", b"x-forwarded-host: evil.example", b"X-Forwarded-Proto: https", b"X-Forwarded-Port: 443",
+             b"Forwarded: for=10.0.0.1;host=evil.example", b"X-Forwardedness: kept", b"X-Kept: end-to-end"]
+    status, data = _send_raw(rig.proxy_port, _raw_post_bytes(tok, lines, _BODY))
+    assert status == 200, data
+    [raw] = tap.raw()
+    head = raw.split(b"\r\n\r\n", 1)[0].lower()
+    for gone in (b"x-forwarded-for", b"x-forwarded-host", b"x-forwarded-proto", b"x-forwarded-port", b"\r\nforwarded:", b"evil.example", b"10.0.0.1"):
+        assert gone not in head, raw
+    assert b"\r\nx-forwardedness: kept" in head and b"\r\nx-kept: end-to-end" in head
+
+
+def test_token_header_names_with_every_tchar_are_forwarded(rig_factory: Any) -> None:
+    tap = RawTap()
+    rig = rig_factory(tap=tap)
+    tok = rig.token("kaia:read")
+    name = b"X-a_b.c~!#$%&'*+^`|9"
+    status, data = _send_raw(rig.proxy_port, _raw_post_bytes(tok, [name + b": v"], _BODY))
+    assert status == 200, data
+    [raw] = tap.raw()
+    assert b"\r\n" + name + b": v\r\n" in raw

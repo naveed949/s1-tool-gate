@@ -16,15 +16,21 @@ For JSON-RPC ``tools/call`` the claims policy decides:
 - allow    -> the original request body is forwarded byte-for-byte, with its
               end-to-end headers line for line (including ``Mcp-Method``/``Mcp-Name``);
               hop-by-hop headers, headers named in ``Connection``, ``Proxy-Connection``,
-              ``Host``, ``Content-Length`` and ``Mcp-Session-Id`` are not forwarded. The
+              ``Host``, ``Content-Length``, ``Mcp-Session-Id`` and the client's own
+              ``Forwarded``/``X-Forwarded-*`` are not forwarded. The
               ``Authorization`` sent upstream is exactly the value the gate verified
 
 Ambiguous or malformed requests are refused with HTTP 400 (``claims_malformed_request``)
 before the token is even checked, so the gate never decides on one reading of a header
 block that the upstream (or an intermediary) could parse differently:
 
+- a raw header line (or the request line) that still holds a CR once its CRLF/LF
+  terminator is removed (RFC 9112 2.2). The stdlib parser splits a line on a bare CR:
+  ``X: a\r\r\n`` or a line that is just ``\r`` ends the header block early and every
+  later line is silently dropped, and ``X: a\rName: v`` becomes two headers;
 - a header line the parser could not take as ``name: value`` (whitespace before the
-  colon, a continuation as the first line, a bare CR): RFC 9112 5.1;
+  colon, a continuation as the first line, no colon), or a header block that ended
+  before its blank line: RFC 9112 5.1. Also a field name that is not an RFC 9110 token;
 - a header value with CR or LF, i.e. an obs-fold continuation line (RFC 9112 5.2),
   or any other control character (C0 except HTAB, or DEL);
 - more than one ``Authorization``, ``Host``, ``Content-Length``, ``Content-Type``,
@@ -129,8 +135,10 @@ _HOP_BY_HOP = frozenset(
 # never forwarded, and an upstream one is never handed out.
 _SESSION_HEADER = "mcp-session-id"
 
-# Not forwarded upstream.
-_REQUEST_SKIP = _HOP_BY_HOP | {_SESSION_HEADER}
+# Not forwarded upstream. ``Forwarded``/``X-Forwarded-*`` come from the client, the gate
+# adds none, and kaia-mcp trusts none: a client must not plant them for a later hop.
+_REQUEST_SKIP = _HOP_BY_HOP | {_SESSION_HEADER, "forwarded"}
+_CLIENT_FORWARDING_PREFIX = "x-forwarded-"
 
 # Not copied from upstream responses; BaseHTTPRequestHandler writes its own.
 _RESPONSE_SKIP = _HOP_BY_HOP | {"date", "server", _SESSION_HEADER}
@@ -155,7 +163,39 @@ _SINGLE_VALUED_LOWER = frozenset(h.lower() for h in _SINGLE_VALUED_HEADERS)
 # (HTAB is allowed) and DEL are not either. CR/LF in a parsed value means obs-fold.
 _CTL = frozenset(chr(c) for c in range(0x20) if c != 0x09) | {"\x7f"}
 _DIGITS = frozenset("0123456789")
+# RFC 9110 5.6.2 tchar. The stdlib parser takes any of 0x21-0x7E except ":" as a name byte.
+_TCHAR = frozenset("!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
 _MAX_REPORTED_NAME = 64
+
+
+def _line_content(line: bytes) -> bytes:
+    """A raw line minus its terminator (CRLF, or a bare LF, which RFC 9112 2.2 lets a recipient accept)."""
+    if line.endswith(b"\r\n"):
+        return line[:-2]
+    if line.endswith(b"\n"):
+        return line[:-1]
+    return line
+
+
+class _LineRecorder:
+    """Wraps the request's rfile while the stdlib reads the header block, keeping each raw line.
+
+    http.client.parse_headers reads the block with readline() and hands the joined text to the
+    email parser, which keeps no trace of where it split lines; the raw lines are the only place
+    a bare CR is still visible. Everything else is delegated to the real file.
+    """
+
+    def __init__(self, rfile: Any) -> None:
+        self._rfile = rfile
+        self.lines: list[bytes] = []
+
+    def readline(self, limit: int = -1) -> bytes:
+        line: bytes = self._rfile.readline(limit)
+        self.lines.append(line)
+        return line
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._rfile, name)
 
 
 def _connection_options(values: list[str]) -> set[str]:
@@ -598,14 +638,44 @@ class _Handler(BaseHTTPRequestHandler):
             {"WWW-Authenticate": www},
         )
 
+    # None until parse_request has read the header block: _ambiguous_header then refuses.
+    _raw_header_lines: list[bytes] | None = None
+
+    def parse_request(self) -> bool:
+        recorder = _LineRecorder(self.rfile)
+        self._raw_header_lines = None
+        self.rfile = recorder  # type: ignore[assignment]
+        try:
+            return super().parse_request()
+        finally:
+            self.rfile = recorder._rfile
+            self._raw_header_lines = recorder.lines
+
     def _ambiguous_header(self) -> tuple[str, str] | None:
         """(header, why) if the header block is malformed or could be read two ways. See the module docstring."""
+        raw_lines = self._raw_header_lines
+        if raw_lines is None:
+            return "header-block", "header block was not recorded"
+        # The email parser splits a line on a bare CR: "X: a\r\r\n" (or a lone "\r" line) ends
+        # the block early with no defect, and "X: a\rName: v" yields two headers. Any CR left
+        # in a raw line once its terminator is removed is refused, so nothing hides behind it.
+        if any(b"\r" in _line_content(line) for line in raw_lines):
+            return "header-block", "bare CR in a header line"
+        if b"\r" in _line_content(self.raw_requestline):
+            return "request-line", "bare CR in the request line"
         # The stdlib parser records a line it could not split into name: value as a
         # defect and silently drops it (and, for some defects, every line after it).
         if self.headers.defects:
             return "header-block", f"malformed header line ({type(self.headers.defects[0]).__name__})"
+        # Lines after an early end of the block are the payload: never checked, never forwarded.
+        # Every known way to get here is refused above; this keeps the invariant if one is missed.
+        if self.headers.get_payload():
+            return "header-block", "header block ended before its blank line"
         for name, value in self.headers.items():
             shown = name[:_MAX_REPORTED_NAME]
+            if not name or not _TCHAR.issuperset(name):
+                return "header-block", "header name is not an RFC 9110 token"
+            # _CTL also holds CR and LF; this branch only picks the clearer message for a fold.
             if "\r" in value or "\n" in value:
                 return shown, f"obs-fold or CR/LF in {shown} header value"
             if not _CTL.isdisjoint(value):
@@ -803,7 +873,7 @@ class _Handler(BaseHTTPRequestHandler):
         headers = [
             (k, authorization if k.lower() == "authorization" else v)
             for k, v in self.headers.items()
-            if k.lower() not in skip
+            if k.lower() not in skip and not k.lower().startswith(_CLIENT_FORWARDING_PREFIX)
         ]
         try:
             conn.putrequest(self.command, target, skip_accept_encoding=True)
