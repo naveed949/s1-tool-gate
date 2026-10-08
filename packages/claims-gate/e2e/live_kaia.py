@@ -185,6 +185,17 @@ def rpc_reachable(url: str, timeout: float = 8.0) -> tuple[bool, str]:
     return False, f"{url}: no JSON-RPC result"
 
 
+# Artifacts this harness writes into --evidence-dir. Several are appended to, so a
+# reused dir is reset first or a previous run's lines would be counted again.
+EVIDENCE_PATTERNS = ("audit-*.jsonl", "proxy-*.log", "kaia-mcp.log", "setup.log", "escalations-cli.log", "escalations.json", "summary.json")
+
+
+def reset_evidence(evidence: Path) -> None:
+    for pattern in EVIDENCE_PATTERNS:
+        for stale in evidence.glob(pattern):
+            stale.unlink()
+
+
 def summarize(checks: list[dict[str, Any]]) -> dict[str, Any]:
     passed = sum(c["result"] == "PASS" for c in checks)
     failed = sum(c["result"] != "PASS" and c["result"] != "SKIP" for c in checks)
@@ -330,6 +341,7 @@ def main() -> int:
 
     evidence = Path(args.evidence_dir).resolve()
     evidence.mkdir(parents=True, exist_ok=True)
+    reset_evidence(evidence)
     work = Path(tempfile.mkdtemp(prefix="s1-live-e2e-"))
     r = Run(evidence)
     started = time.time()

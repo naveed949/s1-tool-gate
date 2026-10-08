@@ -90,3 +90,11 @@ def test_rpc_probe_dead_port() -> None:
         port = s.getsockname()[1]
     ok, detail = live.rpc_reachable(f"http://127.0.0.1:{port}", timeout=2)
     assert ok is False and detail
+
+
+def test_reused_evidence_dir_is_reset_to_this_run(tmp_path: Path) -> None:
+    owned = ["audit-main.jsonl", "audit-drift-runtime.jsonl", "proxy-main.log", "kaia-mcp.log", "setup.log", "escalations-cli.log", "escalations.json", "summary.json"]
+    for name in [*owned, "live-e2e.stdout", "notes.txt"]:
+        (tmp_path / name).write_text("stale\n")
+    live.reset_evidence(tmp_path)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["live-e2e.stdout", "notes.txt"]
