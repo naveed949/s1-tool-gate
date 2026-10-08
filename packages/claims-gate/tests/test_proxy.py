@@ -50,6 +50,8 @@ class FakeKaia:
     jwks_fetches: int = 0
     introspection_calls: int = 0
     sse: bool = False
+    legacy_session: bool = False  # answer with an Mcp-Session-Id like a pre-2026-07-28 server
+    canned: tuple[int, list[tuple[str, str]], bytes] | None = None  # exact MCP response to send
 
 
 def _fake_handler(state: FakeKaia) -> type[BaseHTTPRequestHandler]:
@@ -106,10 +108,20 @@ def _fake_handler(state: FakeKaia) -> type[BaseHTTPRequestHandler]:
 
         def _mcp(self, body: bytes) -> None:
             state.mcp_requests.append({"method": self.command, "path": self.path, "headers": dict(self.headers.items()), "body": body})
+            if state.canned is not None:
+                status, headers, data = state.canned
+                self.send_response(status)
+                for k, v in headers:
+                    self.send_header(k, v)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if state.sse:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Mcp-Session-Id", "sess-123")
+                if state.legacy_session:
+                    self.send_header("Mcp-Session-Id", "sess-123")
                 self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
                 for i in range(3):
@@ -119,7 +131,7 @@ def _fake_handler(state: FakeKaia) -> type[BaseHTTPRequestHandler]:
                 self.wfile.write(b"0\r\n\r\n")
                 return
             msg = json.loads(body) if body else {}
-            self._json(200, {"jsonrpc": "2.0", "id": msg.get("id"), "result": {"echo": msg.get("method")}}, {"Mcp-Session-Id": "sess-123"})
+            self._json(200, {"jsonrpc": "2.0", "id": msg.get("id"), "result": {"echo": msg.get("method")}}, {"Mcp-Session-Id": "sess-123"} if state.legacy_session else None)
 
     return H
 
@@ -203,19 +215,78 @@ def _err(data: bytes) -> dict[str, Any]:
 CALL = lambda tool, i=1, args=None: {"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": tool, "arguments": args if args is not None else {}}}
 
 
-def test_allow_forwards_unchanged_with_session_and_auth(rig_factory: Any) -> None:
-    rig = rig_factory()
+def test_allow_forwards_body_and_auth_unchanged_without_a_session(rig_factory: Any) -> None:
+    """kaia-mcp is stateless (MCP 2026-07-28): a client's stale Mcp-Session-Id is never forwarded."""
+    fake = FakeKaia(signer=TestSigner.generate(kid="kid-1"), legacy_session=True)
+    rig = rig_factory(fake=fake)
     tok = rig.token("kaia:read")
     body = json.dumps(CALL("get_block_number", 7)).encode()
-    status, headers, data = rig.post(body, tok, {"Mcp-Session-Id": "sess-123"})
+    status, headers, data = rig.post(body, tok, {"Mcp-Session-Id": "stale-legacy-session", "Mcp-Method": "tools/call", "Mcp-Name": "get_block_number"})
     assert status == 200
     assert json.loads(data)["result"] == {"echo": "tools/call"}
-    assert headers["mcp-session-id"] == "sess-123"
+    assert "mcp-session-id" not in headers  # nor is an upstream one handed back to the client
     [seen] = rig.fake.mcp_requests
     assert seen["body"] == body
-    assert seen["headers"]["Mcp-Session-Id"] == "sess-123"
+    assert "mcp-session-id" not in {k.lower() for k in seen["headers"]}
     assert seen["headers"]["Authorization"] == f"Bearer {tok}"
+    assert (seen["headers"]["Mcp-Method"], seen["headers"]["Mcp-Name"]) == ("tools/call", "get_block_number")
     assert rig.audit[-1]["event"] == "allow" and rig.audit[-1]["forwarded"] is True
+
+
+def test_decision_uses_the_body_not_mcp_name_headers(rig_factory: Any) -> None:
+    """Mcp-Method/Mcp-Name are forwarded as-is but never trusted: the gate decides on what kaia executes."""
+    rig = rig_factory()
+    status, _, data = rig.post(CALL("encode_function_data"), rig.token("kaia:read"), {"Mcp-Method": "tools/call", "Mcp-Name": "get_block_number"})
+    err = _err(data)
+    assert (status, err["code"], err["data"]["reasonCode"], err["data"]["tool"]) == (200, DENY_CODE, "claims_insufficient_scope", "encode_function_data")
+    assert rig.fake.mcp_requests == []
+
+
+# Captured from kaia-mcp 00f3511 (S2 evidence kaia-probe/probe.json), port normalized.
+KAIA_403_WWW = (
+    'Bearer realm="kaia-mcp", error="insufficient_scope", scope="kaia:encode", '
+    'resource_metadata="http://127.0.0.1:3100/.well-known/oauth-protected-resource", '
+    'error_description="insufficient_scope: encode_function_data requires kaia:encode"'
+)
+KAIA_403_BODY = json.dumps({"jsonrpc": "2.0", "id": 5, "error": {"code": -32042, "message": "insufficient_scope: encode_function_data requires kaia:encode", "data": {"error": "insufficient_scope"}}}).encode()
+
+
+@pytest.mark.parametrize(
+    ("method", "canned"),
+    [
+        ("POST", (403, [("Content-Type", "application/json"), ("Cache-Control", "no-store"), ("WWW-Authenticate", KAIA_403_WWW)], KAIA_403_BODY)),
+        ("POST", (403, [("Content-Type", "application/json"), ("Cache-Control", "no-store")], b'{"jsonrpc":"2.0","error":{"code":-32000,"message":"Forbidden: Origin not allowed"}}')),
+        ("GET", (405, [("Content-Type", "application/json"), ("Allow", "POST")], b'{"jsonrpc":"2.0","error":{"code":-32000,"message":"Method not allowed: the MCP endpoint accepts POST only"},"id":null}')),
+        ("DELETE", (405, [("Content-Type", "application/json"), ("Allow", "POST")], b'{"jsonrpc":"2.0","error":{"code":-32000,"message":"Method not allowed: the MCP endpoint accepts POST only"},"id":null}')),
+    ],
+    ids=["403-insufficient-scope", "403-origin", "405-get", "405-delete"],
+)
+def test_upstream_errors_and_challenges_pass_through_unchanged(rig_factory: Any, method: str, canned: Any) -> None:
+    """kaia's own 403 (insufficient_scope + WWW-Authenticate, Origin) and 405 reach the client as sent.
+
+    The proxy only answers itself for its own decisions (401 token, -32050/-32051 policy);
+    anything kaia says after a forward is relayed, status, challenge and body unchanged.
+    """
+    fake = FakeKaia(signer=TestSigner.generate(kid="kid-1"), canned=canned)
+    rig = rig_factory(fake=fake)
+    tok = rig.token("kaia:read kaia:encode")
+    conn = http.client.HTTPConnection("127.0.0.1", rig.proxy_port, timeout=10)
+    body = json.dumps(CALL("encode_function_data", 5, BALANCE_OF_LIKE)).encode() if method == "POST" else None
+    conn.request(method, "/", body=body, headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json", "Accept": "application/json, text/event-stream", "Origin": "http://evil.example"})
+    r = conn.getresponse()
+    data = r.read()
+    conn.close()
+    status, headers = canned[0], dict(canned[1])
+    assert r.status == status
+    assert data == canned[2]
+    for k, v in headers.items():
+        assert r.getheader(k) == v, k
+    [seen] = rig.fake.mcp_requests
+    assert seen["method"] == method and seen["headers"]["Origin"] == "http://evil.example"  # Origin is kaia's to judge
+    assert rig.audit[-1]["forwarded"] is True and rig.audit[-1]["upstreamStatus"] == status
+
+
+BALANCE_OF_LIKE = {"functionName": "balanceOf", "args": ["0x1234567890123456789012345678901234567890"]}
 
 
 def test_non_tool_methods_need_a_valid_token_then_forward(rig_factory: Any) -> None:
@@ -334,12 +405,12 @@ def test_batches_and_garbage_bodies_are_rejected(rig_factory: Any) -> None:
 
 
 def test_sse_response_streams_through(rig_factory: Any) -> None:
-    fake = FakeKaia(signer=TestSigner.generate(kid="kid-1"), sse=True)
+    fake = FakeKaia(signer=TestSigner.generate(kid="kid-1"), sse=True, legacy_session=True)
     rig = rig_factory(fake=fake)
     status, headers, data = rig.post(CALL("get_block_number"), rig.token("kaia:read"))
     assert status == 200
     assert headers["content-type"] == "text/event-stream"
-    assert headers["mcp-session-id"] == "sess-123"
+    assert "mcp-session-id" not in headers
     assert data.count(b"event: message") == 3
 
 

@@ -13,12 +13,24 @@ For JSON-RPC ``tools/call`` the claims policy decides:
               is recorded as pending; once a human approves it, exactly one
               retry with the same subject, tool, and arguments hash is
               forwarded. A human deny makes identical retries ``-32050``.
-- allow    -> the original request is forwarded byte-for-byte, with its
-              headers (including ``Authorization`` and ``Mcp-Session-Id``)
+- allow    -> the original request body is forwarded byte-for-byte, with its
+              headers (including ``Authorization``, ``Mcp-Method``/``Mcp-Name``)
 
-Other methods (``initialize``, ``tools/list``, notifications, responses, the
-SSE ``GET`` and session ``DELETE``) are forwarded once the token is valid.
-JSON-RPC batches and unparseable bodies are rejected (fail closed).
+Other methods (``initialize``, ``tools/list``, notifications, responses) and
+``GET``/``DELETE`` are forwarded once the token is valid (kaia-mcp >= 00f3511
+answers ``GET``/``DELETE`` with 405). JSON-RPC batches and unparseable bodies are
+rejected (fail closed). Decisions use the JSON-RPC body, the thing the upstream
+executes; ``Mcp-Method``/``Mcp-Name`` headers are relayed but never trusted.
+
+Stateless upstream (MCP 2026-07-28): the proxy keeps no session state, never
+forwards a client's ``Mcp-Session-Id`` (any such id is stale: kaia-mcp no longer
+issues one) and drops one from upstream responses. Anything the upstream answers
+after a forward, including its own ``403`` ``insufficient_scope`` with the
+``WWW-Authenticate`` challenge, an ``Origin`` refusal, or a ``405``, is relayed
+unchanged (status, headers, body). The proxy's own policy deny for a missing
+scope stays in-band (HTTP 200, ``-32050`` ``claims_insufficient_scope``) like
+every other gate deny; it is decided before kaia is asked, so kaia's 403 is only
+seen if kaia's own policy is stricter than the gate's.
 
 The proxy never logs or echoes a token. Logs and the audit file carry a
 12-character sha256 fingerprint at most.
@@ -92,8 +104,15 @@ _HOP_BY_HOP = frozenset(
     }
 )
 
+# MCP 2026-07-28 removed protocol sessions (SEP-2567): a client's id is stale and
+# never forwarded, and an upstream one is never handed out.
+_SESSION_HEADER = "mcp-session-id"
+
+# Not forwarded upstream.
+_REQUEST_SKIP = _HOP_BY_HOP | {_SESSION_HEADER}
+
 # Not copied from upstream responses; BaseHTTPRequestHandler writes its own.
-_RESPONSE_SKIP = _HOP_BY_HOP | {"date", "server"}
+_RESPONSE_SKIP = _HOP_BY_HOP | {"date", "server", _SESSION_HEADER}
 
 JsonFetcher = Callable[..., Any]
 
@@ -652,7 +671,7 @@ class _Handler(BaseHTTPRequestHandler):
         target = (up.path.rstrip("/") + self.config.mcp_path) or "/"
         if query:
             target += "?" + query
-        headers = {k: v for k, v in self.headers.items() if k.lower() not in _HOP_BY_HOP}
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in _REQUEST_SKIP}
         try:
             conn.putrequest(self.command, target, skip_accept_encoding=True)
             for k, v in headers.items():

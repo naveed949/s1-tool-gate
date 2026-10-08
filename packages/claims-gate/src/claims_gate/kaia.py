@@ -1,7 +1,8 @@
 """kaia-mcp fixture: real tool names and scopes.
 
 Source of truth: naveed949/kaia-mcp@253d6c8 ``src/auth/scopes.ts`` (TOOL_SCOPES)
-and ``src/auth/constants.ts`` (SCOPES); the map is unchanged since db76732. Keep
+and ``src/auth/constants.ts`` (SCOPES); the map is unchanged since db76732 and
+still identical at 00f3511 (stateless MCP 2026-07-28, the live e2e pin). Keep
 this list in sync by hand; the claims gate denies any tool not listed here
 (``claims_unknown_tool``). ``claims_gate.proxy`` refuses to start if a live
 kaia-mcp publishes a different map.
