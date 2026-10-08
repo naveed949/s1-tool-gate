@@ -95,8 +95,13 @@ python -m claims_gate proxy --upstream http://127.0.0.1:3100 \
   - The JWKS is cached (`--jwks-ttl`, default 300s). A token with an unknown `kid` triggers a refetch, at most once every 10s. A cache past its TTL whose refetch fails denies with `claims_jwks_unavailable`.
   - A token failure gets HTTP 401 with `WWW-Authenticate: Bearer … resource_metadata=…` and a JSON-RPC error.
 - **Introspection** (optional): `--introspection auto` (the discovery `introspection_endpoint`) or a URL. It uses RFC 7662 with `client_secret_basic`, and credentials come only from `S1_INTROSPECTION_CLIENT_ID` / `S1_INTROSPECTION_CLIENT_SECRET`.
-  - It is called on every request after the JWT checks pass.
+  - It is called after the JWT checks pass. `active: true` answers are cached briefly (see below). Otherwise it is called on every request.
   - `active: false` → `claims_token_revoked`. An unreachable or broken endpoint → `claims_introspection_unavailable`. It fails closed.
+  - **Cache.** `--introspection-cache-ttl` defaults to 10s, and `0` disables it.
+    - Only `active: true` answers are cached. The key is the token's sha256, never the token itself. An entry lives until `min(now + TTL, token exp)`.
+    - `active: false`, HTTP errors, timeouts, and malformed answers are **never cached**. Every one of them is re-asked and denied.
+    - The cache holds at most 10,000 entries. When full it drops expired entries, then clears itself (a miss only costs one introspection call).
+  - **Revocation-latency tradeoff.** With a TTL of *T* seconds, a token revoked at the IdP can still pass the proxy for up to *T* seconds after its last successful introspection. In return, the proxy calls introspection at most once per token per *T* instead of on every MCP request. Pick *T* as the longest revocation delay you can accept. Use `0` when revocation must apply on the very next request. JWT expiry is always checked first, so the cache never extends a token past `exp`.
   - Without introspection, a token revoked at kaia-mcp stays usable at the proxy until `exp`. kaia-mcp still rejects it if forwarded.
 - **`tools/call`** runs the claims policy:
   - **deny** → JSON-RPC error `-32050`, `data: {reasonCode, choice, tool, requiredScope}`. Not forwarded.

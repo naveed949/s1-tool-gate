@@ -24,12 +24,14 @@ from claims_gate.proxy import (
     DENY_CODE,
     ESCALATE_CODE,
     DriftMonitor,
+    Introspector,
     JwksCache,
     UpstreamError,
     build_config,
     check_tool_scope_drift,
     make_server,
 )
+from claims_gate.reasons import ClaimsReason
 from claims_gate.testkit import TestSigner, build_claims, unsigned_token
 
 GATEWAY = ("gw-client", "gw-test-secret")
@@ -280,7 +282,7 @@ def test_proxy_audience_pin_rejects_kaia_tokens(rig_factory: Any) -> None:
 
 
 def test_revoked_token_denied_via_introspection(rig_factory: Any) -> None:
-    rig = rig_factory()
+    rig = rig_factory(introspection_cache_ttl=0)
     tok = rig.token("kaia:read")
     assert rig.post(CALL("get_block_number"), tok)[0] == 200
     rig.fake.revoked.add(tok)
@@ -591,3 +593,100 @@ def test_drift_monitor_starts_failed_closed_without_a_passing_check() -> None:
 def test_build_config_drift_interval_zero_means_startup_check_only(rig_factory: Any) -> None:
     rig = rig_factory(drift_interval=0)
     assert rig.config.drift is None
+
+
+# ---- introspection TTL cache --------------------------------------------------
+
+
+class _IntrospectionFake:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.answer: Any = (200, {"active": True})
+
+    def __call__(self, url: str, **kw: Any) -> tuple[int, Any]:
+        self.calls += 1
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+
+def _introspector(ttl: float, now: list[float], fake: _IntrospectionFake, **kw: Any) -> Introspector:
+    return Introspector("http://idp/introspect", "c", "s", fetch=fake, cache_ttl=ttl, clock=lambda: now[0], **kw)
+
+
+def test_introspection_cache_hits_within_ttl_then_refetches() -> None:
+    now, fake = [1000.0], _IntrospectionFake()
+    intro = _introspector(10, now, fake)
+    assert intro.check("tok-a", expires_at=2000) is None
+    now[0] = 1009.9
+    assert intro.check("tok-a", expires_at=2000) is None
+    assert fake.calls == 1  # cached
+    assert intro.check("tok-b", expires_at=2000) is None and fake.calls == 2  # per token
+    now[0] = 1010.0
+    assert intro.check("tok-a", expires_at=2000) is None and fake.calls == 3  # TTL over
+
+
+def test_introspection_cache_revocation_latency_is_bounded_by_ttl() -> None:
+    now, fake = [1000.0], _IntrospectionFake()
+    intro = _introspector(5, now, fake)
+    assert intro.check("tok", expires_at=2000) is None
+    fake.answer = (200, {"active": False})  # revoked at the IdP
+    now[0] = 1004.0
+    assert intro.check("tok", expires_at=2000) is None  # documented tradeoff: still cached
+    now[0] = 1005.0
+    assert intro.check("tok", expires_at=2000) is ClaimsReason.TOKEN_REVOKED
+
+
+def test_introspection_never_caches_inactive_or_errors() -> None:
+    now, fake = [1000.0], _IntrospectionFake()
+    intro = _introspector(30, now, fake)
+    fake.answer = (200, {"active": False})
+    assert [intro.check("tok", expires_at=2000) for _ in range(3)] == [ClaimsReason.TOKEN_REVOKED] * 3
+    assert fake.calls == 3
+    for answer in (UpstreamError("down"), (503, {"error": "x"}), (200, {"active": "yes"}), (200, None)):
+        fake.answer = answer
+        assert intro.check("tok", expires_at=2000) is ClaimsReason.INTROSPECTION_UNAVAILABLE
+        assert intro.check("tok", expires_at=2000) is ClaimsReason.INTROSPECTION_UNAVAILABLE
+    assert fake.calls == 3 + 8
+    fake.answer = (200, {"active": True})
+    assert intro.check("tok", expires_at=2000) is None and fake.calls == 12
+
+
+def test_introspection_cache_is_bounded_by_token_exp() -> None:
+    now, fake = [1000.0], _IntrospectionFake()
+    intro = _introspector(30, now, fake)
+    assert intro.check("tok", expires_at=1002) is None
+    now[0] = 1001.9
+    assert intro.check("tok", expires_at=1002) is None and fake.calls == 1
+    now[0] = 1002.0
+    assert intro.check("tok", expires_at=1002) is None and fake.calls == 2  # entry dropped at exp
+    assert intro.check("tok2", expires_at=None) is None
+    assert intro.check("tok2", expires_at=None) is None and fake.calls == 4  # no exp known: never cached
+
+
+def test_introspection_cache_ttl_zero_disables_and_keys_are_hashes() -> None:
+    now, fake = [1000.0], _IntrospectionFake()
+    off = _introspector(0, now, fake)
+    for _ in range(3):
+        assert off.check("tok", expires_at=2000) is None
+    assert fake.calls == 3
+    on = _introspector(10, now, fake, max_entries=2)
+    for t in ("secret-token-1", "secret-token-2", "secret-token-3"):
+        on.check(t, expires_at=2000)
+    assert len(on._cache) <= 2
+    assert not any("secret-token" in k for k in on._cache)
+    with pytest.raises(ValueError):
+        _introspector(-1, now, fake)
+
+
+def test_proxy_introspection_cache_end_to_end(rig_factory: Any) -> None:
+    rig = rig_factory(introspection_cache_ttl=0.5)
+    tok = rig.token("kaia:read")
+    assert rig.post(CALL("get_block_number"), tok)[0] == 200
+    rig.fake.revoked.add(tok)
+    assert rig.post(CALL("get_block_number", 2), tok)[0] == 200  # within the cache TTL
+    time.sleep(0.6)
+    status, _, data = rig.post(CALL("get_block_number", 3), tok)
+    assert (status, _err(data)["data"]["reasonCode"]) == (401, "claims_token_revoked")
+    status, _, data = rig.post(CALL("get_block_number", 4), tok)
+    assert (status, _err(data)["data"]["reasonCode"]) == (401, "claims_token_revoked")  # inactive not cached as allow

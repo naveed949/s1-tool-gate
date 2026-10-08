@@ -10,7 +10,7 @@
   [S1_INTROSPECTION_CLIENT_ID=... S1_INTROSPECTION_CLIENT_SECRET=...] \
   python -m claims_gate proxy --upstream URL --issuer ISS --audience AUD [--port N]
       [--introspection auto|URL] [--jwks-uri URL] [--tool-scopes-url URL | --no-drift-check]
-      [--drift-interval SECONDS]
+      [--drift-interval SECONDS] [--introspection-cache-ttl SECONDS]
       [--audit-log FILE] [--wallet-default escalate|deny]
       [--escalation-dir DIR [--escalation-pending-ttl S] [--escalation-approval-ttl S]]
   python -m claims_gate escalations list [--status STATUS] [--dir DIR]
@@ -164,6 +164,7 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
         introspection=args.introspection,
         introspection_client_id=os.environ.get("S1_INTROSPECTION_CLIENT_ID") or None,
         introspection_client_secret=os.environ.get("S1_INTROSPECTION_CLIENT_SECRET") or None,
+        introspection_cache_ttl=args.introspection_cache_ttl,
         tool_scopes_url=args.tool_scopes_url,
         drift_check=not args.no_drift_check,
         drift_interval=args.drift_interval,
@@ -229,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
     p_proxy.add_argument("--jwks-uri", help="override discovery's jwks_uri (also allows a different origin)")
     p_proxy.add_argument("--jwks-ttl", type=float, default=300.0)
     p_proxy.add_argument("--introspection", help="'auto' (discovery) or an RFC 7662 URL; credentials from S1_INTROSPECTION_CLIENT_ID/SECRET")
+    p_proxy.add_argument("--introspection-cache-ttl", type=float, default=10.0, help="seconds to cache active=true introspection answers (bounded by token exp; 0 disables). A revoked token stays usable for at most this long")
     p_proxy.add_argument("--tool-scopes-url", help="default: <upstream>/.well-known/kaia-mcp/tool-scopes")
     p_proxy.add_argument("--no-drift-check", action="store_true", help="skip the tool-scope drift check entirely (not recommended)")
     p_proxy.add_argument("--drift-interval", type=float, default=60.0, help="seconds between tool-scope map rechecks while serving; drift or fetch failure denies every tools/call until fixed (0 = startup check only)")

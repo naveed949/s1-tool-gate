@@ -208,17 +208,70 @@ class JwksCache:
             return self._jwks
 
 
+DEFAULT_INTROSPECTION_CACHE_TTL = 10.0
+
+
 @dataclass
 class Introspector:
-    """RFC 7662 client (``client_secret_basic``). Any failure is reported, never ignored."""
+    """RFC 7662 client (``client_secret_basic``). Any failure is reported, never ignored.
+
+    ``cache_ttl`` > 0 caches **only** ``active: true`` answers, keyed by the
+    token's sha256, until ``min(now + cache_ttl, token exp)``. Inactive answers
+    and every error are never cached, so a revoked token is accepted for at
+    most ``cache_ttl`` seconds after revocation. ``cache_ttl=0`` disables it.
+    """
 
     url: str
     client_id: str
     client_secret: str = field(repr=False)
     timeout: float = 3.0
     fetch: JsonFetcher = http_json
+    cache_ttl: float = DEFAULT_INTROSPECTION_CACHE_TTL
+    max_entries: int = 10_000
+    clock: Callable[[], float] = time.time
+    _cache: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
-    def check(self, token: str) -> ClaimsReason | None:
+    def __post_init__(self) -> None:
+        if self.cache_ttl < 0:
+            raise ValueError("introspection cache TTL must be >= 0")
+
+    def _cached_active(self, key: str, now: float) -> bool:
+        with self._lock:
+            deadline = self._cache.get(key)
+            if deadline is None:
+                return False
+            if now >= deadline:
+                del self._cache[key]
+                return False
+            return True
+
+    def _remember_active(self, key: str, now: float, expires_at: float | None) -> None:
+        if self.cache_ttl <= 0 or expires_at is None:
+            return
+        deadline = min(now + self.cache_ttl, float(expires_at))
+        if deadline <= now:
+            return
+        with self._lock:
+            if len(self._cache) >= self.max_entries:
+                for k in [k for k, d in self._cache.items() if d <= now]:
+                    del self._cache[k]
+                if len(self._cache) >= self.max_entries:
+                    self._cache.clear()
+            self._cache[key] = deadline
+
+    def check(self, token: str, expires_at: float | None = None) -> ClaimsReason | None:
+        """``None`` if active. ``expires_at`` is the verified token ``exp``; without it nothing is cached."""
+        key = hashlib.sha256(token.encode()).hexdigest()
+        now = self.clock()
+        if self.cache_ttl > 0 and self._cached_active(key, now):
+            return None
+        reason = self._introspect(token)
+        if reason is None:
+            self._remember_active(key, now, expires_at)
+        return reason
+
+    def _introspect(self, token: str) -> ClaimsReason | None:
         try:
             status, doc = self.fetch(
                 self.url,
@@ -382,7 +435,7 @@ def check_token(config: ProxyConfig, authorization: str | None) -> TokenCheck:
     if isinstance(verified, ClaimsFailure):
         return TokenCheck(None, verified.reason, fp)
     if config.introspector is not None:
-        reason = config.introspector.check(token)
+        reason = config.introspector.check(token, expires_at=verified.expires_at)
         if reason is not None:
             return TokenCheck(None, reason, fp)
     return TokenCheck(verified, None, fp)
@@ -663,6 +716,7 @@ def build_config(
     introspection: str | None = None,
     introspection_client_id: str | None = None,
     introspection_client_secret: str | None = None,
+    introspection_cache_ttl: float = DEFAULT_INTROSPECTION_CACHE_TTL,
     tool_scopes_url: str | None = None,
     drift_check: bool = True,
     drift_interval: float = 60.0,
@@ -705,7 +759,10 @@ def build_config(
         if not introspection_client_id or not introspection_client_secret:
             errors.append("introspection is configured but S1_INTROSPECTION_CLIENT_ID/SECRET are not set")
         else:
-            introspector = Introspector(introspection_url, introspection_client_id, introspection_client_secret, fetch=fetch)
+            try:
+                introspector = Introspector(introspection_url, introspection_client_id, introspection_client_secret, fetch=fetch, cache_ttl=introspection_cache_ttl)
+            except ValueError as err:
+                errors.append(f"introspection: {err}")
 
     drift = None
     monitor = None
