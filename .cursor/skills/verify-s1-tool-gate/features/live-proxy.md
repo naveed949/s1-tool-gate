@@ -1,6 +1,6 @@
 # Live proxy
 
-`python -m claims_gate proxy` sits in front of a real, running kaia-mcp. Every MCP request needs a token that verifies against kaia-mcp's JWKS with the pinned issuer and audience, and that introspection still reports active. Active answers are cached for a short TTL. `tools/call` is gated by the claims policy:
+`python -m claims_gate proxy` sits in front of a real, running kaia-mcp. Every MCP request needs a token that verifies against kaia-mcp's JWKS with the pinned issuer and audience, and that introspection still reports active. By default every request is introspected; caching active answers for a TTL is opt-in (`--introspection-cache-ttl`). `tools/call` is gated by the claims policy:
 - allowed calls are forwarded unchanged
 - denied calls get a `claims_*` JSON-RPC error
 - `generate_wallet` is escalated and queued for a human, who can approve exactly one identical retry
@@ -17,9 +17,10 @@ Denied and unapproved calls never reach kaia-mcp. The proxy will not start if ka
 - `proxy-escalation-deny`: after `escalations deny <id>`, the identical retry gets `-32050` `claims_escalation_denied` with that id and is not forwarded.
 - `proxy-forged`: the same claims and the real `kid`, signed by a foreign key, get HTTP 401 `claims_invalid_token`.
 - `proxy-wrong-aud`: a proxy pinned to audience `other-api` refuses kaia tokens (`aud=kaia-mcp`) with `claims_audience_mismatch`.
-- `proxy-revoked`: after `POST /oauth/revoke` at kaia-mcp, the token still verifies offline.
-  - Within the proxy's introspection cache TTL (the e2e uses 3s), the proxy still forwards it, and kaia-mcp refuses it with 401.
-  - After the TTL, the proxy denies it with `claims_token_revoked`.
+- `proxy-revoked` (default, cache off): after `POST /oauth/revoke` at kaia-mcp, the token still verifies offline, yet the very next request through the main proxy is denied with `claims_token_revoked` and not forwarded.
+- `proxy-revoked-cache-opt-in`: a separate proxy started with an explicit `--introspection-cache-ttl 3`.
+  - Within that TTL it still forwards the revoked token, and kaia-mcp refuses it with 401.
+  - After the TTL it denies it with `claims_token_revoked`, and again on the next request (inactive answers are never cached).
 - `proxy-introspection-down`: with introspection configured but unreachable, the proxy fails closed (`claims_introspection_unavailable`).
 - `proxy-expired`: once kaia-mcp's short TTL passes, the same bearer gets `claims_expired`.
 - `proxy-drift`: a missing or changed tool-scope map makes the proxy exit 3 without listening.
@@ -47,7 +48,7 @@ Preconditions:
   - Otherwise, network access to clone the pinned commit and run `npm ci`.
 - Optional: egress to the Kaia RPC (`KAIA_RPC_URL`, default `https://public-en.node.kaia.io`) for `allow-read`. Without it, that one check SKIPs.
 
-- **Run.** `S1_VERIFY_KAIA_DIR=<kaia-mcp checkout> .cursor/skills/verify-s1-tool-gate/helpers/drive.sh live-proxy`. It takes about 20s plus build time. That includes the 3s cache window and the wait for token expiry.
+- **Run.** `S1_VERIFY_KAIA_DIR=<kaia-mcp checkout> .cursor/skills/verify-s1-tool-gate/helpers/drive.sh live-proxy`. It takes about 20s plus build time. That includes the 3s opt-in cache window and the wait for token expiry.
 - **Allow.**
   - `allow-encode` has `result: PASS`, a `resultText` of `0x70a08231` followed by 64 hex chars, and `kaiaToolCallLines: 1`.
   - `allow-read` is either PASS with `Current block number on mainnet: <n>`, or SKIP with a `skipReason` naming the RPC URL and its error.
@@ -61,7 +62,8 @@ Preconditions:
   - `escalations.json` holds the final rows (argument hashes only), and `escalations-cli.log` holds every CLI call.
 - **Token failures.**
   - `forged-denied`, `wrong-aud-denied`, `introspection-down`, and `expired-denied` each show `status: 401` and the expected `reasonCode`.
-  - `revoked-denied` shows `statusBeforeRevoke: 200`, `stillValidOffline: true`, `withinCacheTtl.proxyForwarded: true` (with `kaiaStatus: 401`), and then `reasonCode: claims_token_revoked`.
+  - `revoked-denied` shows `statusBeforeRevoke: 200`, `stillValidOffline: true`, `introspectionCache: "default (off)"`, and `nextRequest` with `status: 401`, `reasonCode: claims_token_revoked`, `auditLines: 1`, `forwarded: false`.
+  - `revoked-cache-window-opt-in` shows `introspectionCacheTtl: 3.0`, `withinCacheTtl.proxyForwarded: true` (with `kaiaStatus: 401`), and `afterTtl` as two `401` / `claims_token_revoked` entries. Its proxy log and audit are `proxy-cache-opt-in.log` and `audit-cache-opt-in.jsonl`.
 - **Drift.**
   - `drift-refused-missing` and `drift-refused-changed` show `exitCode: 3`, and `proxy-drift-*.log` contains `refusing to start` and no `ready:`.
   - `drift-runtime-fail-closed` shows `flippedToClosed: true`, `duringDriftReason: claims_tool_scope_drift`, `recovered: true`, `kaiaToolCallLines` going `[n, n+1, n+2]` (the drift-time call is not forwarded), and `transitionsLogged: [true, true]`.

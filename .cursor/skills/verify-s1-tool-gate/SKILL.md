@@ -1,6 +1,6 @@
 ---
 name: verify-s1-tool-gate
-description: Verify s1-tool-gate's OIDC/OAuth claims gate (packages/claims-gate) by driving its CLI with run-time TEST-ONLY JWTs against the kaia-mcp tool/scope fixture, and its live reverse proxy in front of a real kaia-mcp. Use when proving claim-to-policy decisions (allow, deny-by-scope, expired, wrong audience/issuer, forged, unauthenticated), wallet escalation, the gate-in-front-of-enforcement demo, or live proxy enforcement (escalation queue approve-once/deny, introspection revocation and its cache window, startup and runtime tool-scope drift, nothing denied reaches kaia-mcp).
+description: Verify s1-tool-gate's OIDC/OAuth claims gate (packages/claims-gate) by driving its CLI with run-time TEST-ONLY JWTs against the kaia-mcp tool/scope fixture, and its live reverse proxy in front of a real kaia-mcp. Use when proving claim-to-policy decisions (allow, deny-by-scope, expired, wrong audience/issuer, forged, unauthenticated), wallet escalation, the gate-in-front-of-enforcement demo, or live proxy enforcement (escalation queue approve-once/deny, next-request introspection revocation by default and the opt-in cache window, startup and runtime tool-scope drift, nothing denied reaches kaia-mcp).
 ---
 
 # Verify s1-tool-gate (claims gate)
@@ -65,7 +65,7 @@ Stable handles:
 - Scopes are `kaia:read`, `kaia:encode`, `kaia:wallet`.
 - Reason codes are the `claims_*` values in `packages/claims-gate/README.md`.
 
-`live-proxy` is the deployment path. A device-flow login against kaia-mcp's demo IdP produces a real kaia JWT. MCP JSON-RPC then goes through the proxy, and the drive asserts all 17 checks in `summary.json`. Each check must have `result: PASS`. The one exception is `allow-read` (a live chain read), which may be `SKIP` when the Kaia RPC is unreachable. The drive prints it as `skip` and still passes. A required check can never SKIP.
+`live-proxy` is the deployment path. A device-flow login against kaia-mcp's demo IdP produces a real kaia JWT. MCP JSON-RPC then goes through the proxy, and the drive asserts all 18 checks in `summary.json`. Each check must have `result: PASS`. The one exception is `allow-read` (a live chain read), which may be `SKIP` when the Kaia RPC is unreachable. The drive prints it as `skip` and still passes. A required check can never SKIP.
 
 Follow every entry point listed in the matching `features/` file.
 

@@ -46,5 +46,5 @@ Each feature file starts with an H1 and one paragraph. Then come exactly four H2
 - [Live proxy](./live-proxy.md): `python -m claims_gate proxy` in front of a real, running kaia-mcp.
   - Allowed calls go through. `encode_function_data` is the required check and works offline; the live chain read is optional.
   - Denies and unapproved wallet escalations never reach kaia-mcp. A human-approved escalation reaches it exactly once.
-  - Forged, wrong-audience, expired, and revoked tokens are refused. A revoked token is refused once the short introspection cache entry runs out.
+  - Forged, wrong-audience, expired, and revoked tokens are refused. With the default (introspection cache off) a revoked token is refused on the very next request; a proxy that opts in to a cache TTL refuses it once the entry runs out.
   - The proxy will not start on tool-scope drift, and drift at runtime denies every `tools/call` until the maps match again.

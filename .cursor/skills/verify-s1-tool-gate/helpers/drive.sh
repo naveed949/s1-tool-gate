@@ -154,7 +154,7 @@ except OSError:
     print(f"  FAIL live-proxy: no summary.json (exit {rc}); see {out}/live-e2e.stdout"); sys.exit(1)
 want = ["initialize-through-proxy", "encode-denied", "wallet-escalated", "escalation-approved-once",
         "escalation-denied", "forged-denied", "wrong-aud-denied", "introspection-down", "allow-encode",
-        "revoked-denied", "drift-refused-missing", "drift-refused-changed", "drift-runtime-fail-closed",
+        "revoked-denied", "revoked-cache-window-opt-in", "drift-refused-missing", "drift-refused-changed", "drift-runtime-fail-closed",
         "allow-read", "expired-denied", "audit-denies-never-forwarded", "no-token-in-logs"]
 # Only allow-read (needs the public Kaia RPC) may SKIP; every other check must PASS.
 optional = {"allow-read"}
