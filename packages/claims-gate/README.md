@@ -95,13 +95,13 @@ python -m claims_gate proxy --upstream http://127.0.0.1:3100 \
   - The JWKS is cached (`--jwks-ttl`, default 300s). A token with an unknown `kid` triggers a refetch, at most once every 10s. A cache past its TTL whose refetch fails denies with `claims_jwks_unavailable`.
   - A token failure gets HTTP 401 with `WWW-Authenticate: Bearer … resource_metadata=…` and a JSON-RPC error.
 - **Introspection** (optional): `--introspection auto` (the discovery `introspection_endpoint`) or a URL. It uses RFC 7662 with `client_secret_basic`, and credentials come only from `S1_INTROSPECTION_CLIENT_ID` / `S1_INTROSPECTION_CLIENT_SECRET`.
-  - It is called after the JWT checks pass. `active: true` answers are cached briefly (see below). Otherwise it is called on every request.
+  - It is called after the JWT checks pass, on **every request** by default. Caching `active: true` answers is opt-in (see below).
   - `active: false` → `claims_token_revoked`. An unreachable or broken endpoint → `claims_introspection_unavailable`. It fails closed.
-  - **Cache.** `--introspection-cache-ttl` defaults to 10s, and `0` disables it.
+  - **Cache (off by default).** `--introspection-cache-ttl` defaults to `0`: nothing is cached, every request is introspected, and a token revoked at the IdP is denied on the very next request. To enable the cache, pass a positive number of seconds, e.g. `--introspection-cache-ttl 5`. With a TTL set:
     - Only `active: true` answers are cached. The key is the token's sha256, never the token itself. An entry lives until `min(now + TTL, token exp)`.
     - `active: false`, HTTP errors, timeouts, and malformed answers are **never cached**. Every one of them is re-asked and denied.
     - The cache holds at most 10,000 entries. When full it drops expired entries, then clears itself (a miss only costs one introspection call).
-  - **Revocation-latency tradeoff.** With a TTL of *T* seconds, a token revoked at the IdP can still pass the proxy for up to *T* seconds after its last successful introspection. In return, the proxy calls introspection at most once per token per *T* instead of on every MCP request. Pick *T* as the longest revocation delay you can accept. Use `0` when revocation must apply on the very next request. JWT expiry is always checked first, so the cache never extends a token past `exp`.
+  - **Revocation-latency tradeoff.** With a TTL of *T* seconds, a token revoked at the IdP can still pass the proxy for up to *T* seconds after its last successful introspection. In return, the proxy calls introspection at most once per token per *T* instead of on every MCP request. Only opt in when introspection load matters, and pick *T* as the longest revocation delay you can accept. Leave it at the default `0` when revocation must apply on the very next request. JWT expiry is always checked first, so the cache never extends a token past `exp`.
   - Without introspection, a token revoked at kaia-mcp stays usable at the proxy until `exp`. kaia-mcp still rejects it if forwarded.
 - **`tools/call`** runs the claims policy:
   - **deny** → JSON-RPC error `-32050`, `data: {reasonCode, choice, tool, requiredScope}`. Not forwarded.
@@ -146,7 +146,7 @@ Approval only turns an *escalate* into one allow. The claims policy runs first, 
 
 ### Live e2e
 
-[`e2e/live_kaia.py`](e2e/live_kaia.py) starts kaia-mcp, either cloned at a pinned commit (`--kaia-ref`, default in the script) or from a local checkout (`--kaia-dir` / `KAIA_MCP_DIR`). It then starts the proxy (with an escalation queue and a 3s introspection cache) and logs in with the **device flow**. It proves each of these:
+[`e2e/live_kaia.py`](e2e/live_kaia.py) starts kaia-mcp, either cloned at a pinned commit (`--kaia-ref`, default in the script) or from a local checkout (`--kaia-dir` / `KAIA_MCP_DIR`). It then starts the proxy (with an escalation queue and the default introspection cache, which is off) and logs in with the **device flow**. It proves each of these:
 
 - `encode_function_data` with `kaia:encode` returns `balanceOf` calldata through the proxy. This is the **required allow-path check**, and it is fully offline.
 - `encode_function_data` without `kaia:encode` is denied by scope at the proxy, and kaia-mcp's log has zero `Tool call` lines for it.
@@ -154,7 +154,8 @@ Approval only turns an *escalate* into one allow. The claims policy runs first, 
   - After `escalations approve <id>`, exactly one identical retry reaches kaia-mcp. kaia-mcp itself still refuses it (`tool_disabled`). The next retry is escalated again with a new id.
   - After `escalations deny <id>`, the identical retry gets `claims_escalation_denied`.
 - Forged, wrong-audience, and expired tokens are denied.
-- A token revoked at kaia-mcp still verifies offline. The proxy forwards it only while its introspection cache entry lives, and kaia-mcp refuses it on its own. After that the proxy denies it with `claims_token_revoked`.
+- A token revoked at kaia-mcp still verifies offline, yet with the default settings the proxy denies it with `claims_token_revoked` on the very next request, without forwarding it.
+- A separate proxy that opts in with `--introspection-cache-ttl 3` forwards the revoked token only while its cache entry lives, and kaia-mcp refuses it on its own. After the TTL that proxy denies it with `claims_token_revoked` every time.
 - Unreachable introspection fails closed.
 - The proxy refuses to start on a missing or changed tool-scope map.
 - While running with `--drift-interval 1`, a map change makes the proxy deny `tools/call` with `claims_tool_scope_drift`, and restoring the map lets calls through again.

@@ -21,6 +21,7 @@ import pytest
 from claims_gate.escalations import EscalationStore, args_hash
 from claims_gate.kaia import KAIA_TOOL_SCOPES, kaia_policy
 from claims_gate.proxy import (
+    DEFAULT_INTROSPECTION_CACHE_TTL,
     DENY_CODE,
     ESCALATE_CODE,
     DriftMonitor,
@@ -47,6 +48,7 @@ class FakeKaia:
     tool_scopes: dict[str, str] = field(default_factory=lambda: dict(KAIA_TOOL_SCOPES))
     mcp_requests: list[dict[str, Any]] = field(default_factory=list)
     jwks_fetches: int = 0
+    introspection_calls: int = 0
     sse: bool = False
 
 
@@ -85,6 +87,8 @@ def _fake_handler(state: FakeKaia) -> type[BaseHTTPRequestHandler]:
             body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
             if self.path == "/oauth/introspect":
                 import base64
+
+                state.introspection_calls += 1
 
                 expected = "Basic " + base64.b64encode(f"{GATEWAY[0]}:{GATEWAY[1]}".encode()).decode()
                 if self.headers.get("Authorization") != expected:
@@ -282,13 +286,24 @@ def test_proxy_audience_pin_rejects_kaia_tokens(rig_factory: Any) -> None:
 
 
 def test_revoked_token_denied_via_introspection(rig_factory: Any) -> None:
-    rig = rig_factory(introspection_cache_ttl=0)
+    rig = rig_factory()  # default: introspection cache off -> revocation applies on the very next request
     tok = rig.token("kaia:read")
     assert rig.post(CALL("get_block_number"), tok)[0] == 200
     rig.fake.revoked.add(tok)
     status, _, data = rig.post(CALL("get_block_number"), tok)
     assert (status, _err(data)["data"]["reasonCode"]) == (401, "claims_token_revoked")
     assert len(rig.fake.mcp_requests) == 1
+
+
+def test_introspection_cache_is_off_by_default_every_request_introspected(rig_factory: Any) -> None:
+    assert DEFAULT_INTROSPECTION_CACHE_TTL == 0
+    rig = rig_factory()
+    assert rig.config.introspector is not None
+    assert rig.config.introspector.cache_ttl == 0
+    tok = rig.token("kaia:read")
+    for i in range(3):
+        assert rig.post(CALL("get_block_number", i + 1), tok)[0] == 200
+    assert rig.fake.introspection_calls == 3
 
 
 def test_introspection_failure_fails_closed(rig_factory: Any) -> None:
@@ -662,6 +677,16 @@ def test_introspection_cache_is_bounded_by_token_exp() -> None:
     assert intro.check("tok", expires_at=1002) is None and fake.calls == 2  # entry dropped at exp
     assert intro.check("tok2", expires_at=None) is None
     assert intro.check("tok2", expires_at=None) is None and fake.calls == 4  # no exp known: never cached
+
+
+def test_introspector_default_never_caches() -> None:
+    fake = _IntrospectionFake()
+    intro = Introspector("http://idp/introspect", "c", "s", fetch=fake)
+    assert intro.cache_ttl == 0
+    assert [intro.check("tok", expires_at=time.time() + 600) for _ in range(3)] == [None] * 3
+    assert fake.calls == 3 and intro._cache == {}
+    fake.answer = (200, {"active": False})
+    assert intro.check("tok", expires_at=time.time() + 600) is ClaimsReason.TOKEN_REVOKED
 
 
 def test_introspection_cache_ttl_zero_disables_and_keys_are_hashes() -> None:

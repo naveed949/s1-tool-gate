@@ -26,7 +26,9 @@ introspection setup, or the tool-scope drift check fails (fail closed).
 While serving it rechecks the tool-scope map every ``--drift-interval``
 seconds (default 60; 0 = startup only) and denies every ``tools/call`` while
 the maps differ or the map cannot be fetched.
-Introspection credentials come from the environment, never argv.
+Introspection credentials come from the environment, never argv. The
+introspection cache is off by default (every request is introspected); a
+positive ``--introspection-cache-ttl`` opts in and bounds revocation latency.
 ``escalations`` reads the queue in ``--dir`` (default ``$S1_ESCALATION_DIR``),
 prints JSON, and exits 0; 1 if the approve/deny is not allowed from the
 escalation's current state; 2 if no queue directory was given.
@@ -193,7 +195,7 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m claims_gate")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -230,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
     p_proxy.add_argument("--jwks-uri", help="override discovery's jwks_uri (also allows a different origin)")
     p_proxy.add_argument("--jwks-ttl", type=float, default=300.0)
     p_proxy.add_argument("--introspection", help="'auto' (discovery) or an RFC 7662 URL; credentials from S1_INTROSPECTION_CLIENT_ID/SECRET")
-    p_proxy.add_argument("--introspection-cache-ttl", type=float, default=10.0, help="seconds to cache active=true introspection answers (bounded by token exp; 0 disables). A revoked token stays usable for at most this long")
+    p_proxy.add_argument("--introspection-cache-ttl", type=float, default=0.0, help="opt-in: seconds to cache active=true introspection answers (bounded by token exp). Default 0 = off, every request is introspected and a revocation applies on the next request. With a TTL, a revoked token stays usable at the proxy for up to that long")
     p_proxy.add_argument("--tool-scopes-url", help="default: <upstream>/.well-known/kaia-mcp/tool-scopes")
     p_proxy.add_argument("--no-drift-check", action="store_true", help="skip the tool-scope drift check entirely (not recommended)")
     p_proxy.add_argument("--drift-interval", type=float, default=60.0, help="seconds between tool-scope map rechecks while serving; drift or fetch failure denies every tools/call until fixed (0 = startup check only)")
@@ -250,8 +252,11 @@ def main(argv: list[str] | None = None) -> int:
     p_esc.add_argument("--dir", help="queue directory (default $S1_ESCALATION_DIR)")
     p_esc.add_argument("--status", choices=["pending", "approved", "denied", "expired", "consumed"])
     p_esc.set_defaults(func=_cmd_escalations)
+    return parser
 
-    args = parser.parse_args(argv)
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     return int(args.func(args))
 
 

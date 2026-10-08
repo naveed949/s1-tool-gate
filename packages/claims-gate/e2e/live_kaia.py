@@ -18,9 +18,12 @@ with the device flow against kaia-mcp's demo IdP, and proves:
   introspection-down         introspection configured but unreachable -> claims_introspection_unavailable
   allow-encode               REQUIRED allow path, offline: encode_function_data with kaia:encode
                              returns balanceOf calldata (0x70a08231...) from kaia-mcp
-  revoked-denied             token revoked at kaia-mcp, still valid offline: the proxy forwards it only
-                             while its introspection cache entry lives (3s; kaia-mcp itself then
-                             refuses it), after that the proxy denies claims_token_revoked
+  revoked-denied             token revoked at kaia-mcp, still valid offline: with the default
+                             introspection cache (off) the very next request is denied at the proxy
+                             (claims_token_revoked, not forwarded)
+  revoked-cache-window-opt-in  separate proxy with an explicit --introspection-cache-ttl 3: the revoked
+                             token is forwarded only while its cache entry lives (kaia-mcp itself then
+                             refuses it), after that the proxy denies claims_token_revoked every time
   drift-refused-missing/changed  proxy refuses to start when the tool-scope map is missing or differs
   drift-runtime-fail-closed  proxy running with --drift-interval 1: the map changes -> tools/call
                              denied (claims_tool_scope_drift, not forwarded); map restored -> allowed
@@ -74,7 +77,8 @@ INTROSPECTION_CLIENT_ID = "s1-tool-gate"
 DEFAULT_KAIA_RPC = "https://public-en.node.kaia.io"
 # Checks allowed to SKIP (environment-dependent). Everything else must PASS.
 OPTIONAL_CHECKS = frozenset({"allow-read"})
-INTROSPECTION_CACHE_TTL = 3.0
+# Opt-in TTL used only by the revoked-cache-window-opt-in check; the main proxy runs the default (off).
+OPT_IN_INTROSPECTION_CACHE_TTL = 3.0
 BALANCE_OF_ABI = json.dumps([{"type": "function", "name": "balanceOf", "inputs": [{"name": "account", "type": "address"}], "outputs": [{"type": "uint256"}], "stateMutability": "view"}])
 BALANCE_OF_ARGS = {"abi": BALANCE_OF_ABI, "functionName": "balanceOf", "args": ["0x1234567890123456789012345678901234567890"]}
 JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
@@ -371,7 +375,7 @@ def main() -> int:
 
         gw_env = {"S1_INTROSPECTION_CLIENT_ID": INTROSPECTION_CLIENT_ID, "S1_INTROSPECTION_CLIENT_SECRET": introspection_secret}
         esc_dir = work / "escalations"
-        proxy_url, _, _ = start_proxy(r, "main", kaia_url, extra=["--introspection", "auto", "--introspection-cache-ttl", str(INTROSPECTION_CACHE_TTL), "--escalation-dir", str(esc_dir)], env_extra=gw_env)
+        proxy_url, _, _ = start_proxy(r, "main", kaia_url, extra=["--introspection", "auto", "--escalation-dir", str(esc_dir)], env_extra=gw_env)
         log(f"proxy up at {proxy_url}")
 
         def escalations(*cli: str) -> tuple[int, Any]:
@@ -456,28 +460,50 @@ def main() -> int:
         text = result_text(body)
         r.check("allow-encode", st_init == 200 and st == 200 and "error" not in (body or {}) and re.fullmatch(r"0x70a08231[0-9a-fA-F]{64}", text.strip()) is not None and tool_calls(kaia_log, "encode_function_data") == before + 1, status=st, resultText=text[:200], kaiaToolCallLines=tool_calls(kaia_log, "encode_function_data"))
 
+        # Default introspection cache (off): revocation applies on the very next request.
         t2 = device_login(kaia_url, "kaia:read")
         r.tokens += [t2["access_token"], t2["refresh_token"]]
-        m2 = Mcp(proxy_url, t2["access_token"])
-        st_before, _ = m2.initialize()
-        cached_at = time.time()
+        st_before, _ = Mcp(proxy_url, t2["access_token"]).initialize()
         rv_status, _ = form(kaia_url + "/oauth/revoke", {"token": t2["access_token"]})
         _, _, jwks_raw = request("GET", kaia_url + "/oauth/jwks")
         offline = verify_access_token(t2["access_token"], VerifierConfig(jwks=json.loads(jwks_raw), issuer=kaia_url, audience="kaia-mcp"))
-        # Within the cache TTL the proxy still lets the revoked token through (documented
+        audit_main = evidence / "audit-main.jsonl"
+        audit_lines_before = len(audit_main.read_text().splitlines())
+        st, body = Mcp(proxy_url, t2["access_token"]).initialize()
+        next_audit = [json.loads(line) for line in audit_main.read_text().splitlines()[audit_lines_before:] if line.strip()]
+        next_forwarded = any(a.get("forwarded") for a in next_audit)
+        r.check(
+            "revoked-denied",
+            st_before == 200 and rv_status == 200 and isinstance(offline, VerifiedClaims) and st == 401 and reason(body) == "claims_token_revoked"
+            and len(next_audit) == 1 and next_audit[0].get("reasonCode") == "claims_token_revoked" and not next_forwarded,
+            statusBeforeRevoke=st_before, revokeStatus=rv_status, stillValidOffline=isinstance(offline, VerifiedClaims),
+            introspectionCache="default (off)", nextRequest={"status": st, "reasonCode": reason(body), "auditLines": len(next_audit), "forwarded": next_forwarded},
+            status=st, reasonCode=reason(body),
+        )
+
+        # Opt-in cache window: a separate proxy started with an explicit positive TTL.
+        cache_url, _, _ = start_proxy(r, "cache-opt-in", kaia_url, extra=["--introspection", "auto", "--introspection-cache-ttl", str(OPT_IN_INTROSPECTION_CACHE_TTL)], env_extra=gw_env)
+        t6 = device_login(kaia_url, "kaia:read")
+        r.tokens += [t6["access_token"], t6["refresh_token"]]
+        st_c_before, _ = Mcp(cache_url, t6["access_token"]).initialize()
+        cached_at = time.time()
+        rv_c_status, _ = form(kaia_url + "/oauth/revoke", {"token": t6["access_token"]})
+        # Within the opt-in TTL the proxy still lets the revoked token through (documented
         # revocation latency); kaia-mcp then refuses it itself (defense in depth).
-        st_cached, b_cached = Mcp(proxy_url, t2["access_token"]).initialize()
+        st_cached, b_cached = Mcp(cache_url, t6["access_token"]).initialize()
         cached_window = time.time() - cached_at
         proxy_reason_cached = reason(b_cached)
         proxy_let_through = not (proxy_reason_cached or "").startswith("claims_")
-        time.sleep(max(0.0, cached_at + INTROSPECTION_CACHE_TTL + 0.5 - time.time()))
-        st, body = Mcp(proxy_url, t2["access_token"]).initialize()
+        time.sleep(max(0.0, cached_at + OPT_IN_INTROSPECTION_CACHE_TTL + 0.5 - time.time()))
+        st_c, b_c = Mcp(cache_url, t6["access_token"]).initialize()
+        st_c2, b_c2 = Mcp(cache_url, t6["access_token"]).initialize()  # inactive is never cached as allow
         r.check(
-            "revoked-denied",
-            st_before == 200 and rv_status == 200 and isinstance(offline, VerifiedClaims) and cached_window < INTROSPECTION_CACHE_TTL and proxy_let_through and st == 401 and reason(body) == "claims_token_revoked",
-            statusBeforeRevoke=st_before, revokeStatus=rv_status, stillValidOffline=isinstance(offline, VerifiedClaims),
-            introspectionCacheTtl=INTROSPECTION_CACHE_TTL, withinCacheTtl={"proxyForwarded": proxy_let_through, "proxyReasonCode": proxy_reason_cached, "kaiaStatus": st_cached},
-            status=st, reasonCode=reason(body),
+            "revoked-cache-window-opt-in",
+            st_c_before == 200 and rv_c_status == 200 and cached_window < OPT_IN_INTROSPECTION_CACHE_TTL and proxy_let_through and st_cached == 401
+            and st_c == 401 and reason(b_c) == "claims_token_revoked" and st_c2 == 401 and reason(b_c2) == "claims_token_revoked",
+            statusBeforeRevoke=st_c_before, revokeStatus=rv_c_status, introspectionCacheTtl=OPT_IN_INTROSPECTION_CACHE_TTL,
+            withinCacheTtl={"proxyForwarded": proxy_let_through, "proxyReasonCode": proxy_reason_cached, "kaiaStatus": st_cached},
+            afterTtl=[{"status": st_c, "reasonCode": reason(b_c)}, {"status": st_c2, "reasonCode": reason(b_c2)}],
         )
 
         for name, url_or_doc in (("drift-missing", kaia_url + "/.well-known/kaia-mcp/does-not-exist"), ("drift-changed", dict(KAIA_TOOL_SCOPES, encode_function_data="kaia:read"))):

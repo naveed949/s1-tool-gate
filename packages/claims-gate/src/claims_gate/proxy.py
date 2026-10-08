@@ -208,17 +208,21 @@ class JwksCache:
             return self._jwks
 
 
-DEFAULT_INTROSPECTION_CACHE_TTL = 10.0
+# Off by default: every request is introspected, so a revocation applies on the very
+# next request. Operators opt in to a positive TTL and accept that revocation latency.
+DEFAULT_INTROSPECTION_CACHE_TTL = 0.0
 
 
 @dataclass
 class Introspector:
     """RFC 7662 client (``client_secret_basic``). Any failure is reported, never ignored.
 
-    ``cache_ttl`` > 0 caches **only** ``active: true`` answers, keyed by the
-    token's sha256, until ``min(now + cache_ttl, token exp)``. Inactive answers
-    and every error are never cached, so a revoked token is accepted for at
-    most ``cache_ttl`` seconds after revocation. ``cache_ttl=0`` disables it.
+    ``cache_ttl`` defaults to 0 (no cache: every check calls the endpoint, so a
+    revocation applies on the very next request). An opt-in ``cache_ttl`` > 0
+    caches **only** ``active: true`` answers, keyed by the token's sha256, until
+    ``min(now + cache_ttl, token exp)``. Inactive answers and every error are
+    never cached, so a revoked token is accepted for at most ``cache_ttl``
+    seconds after revocation.
     """
 
     url: str
