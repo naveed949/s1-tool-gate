@@ -28,7 +28,9 @@ The proxy calls ``on_escalate`` whenever the claims policy says *escalate*:
   otherwise                                      -> ``escalate`` with a new pending row
 
 Each call is one ``BEGIN IMMEDIATE`` transaction, so a single approval can never
-be consumed twice, even across proxy threads or processes. Arguments are never
+be consumed twice, even across proxy threads or processes. Every state-changing
+UPDATE is also guarded on the row's current status and must change exactly one
+row, or the transition is refused (consume: not allowed; approve/deny: error). Arguments are never
 stored, only their hash. Approval can only turn an *escalate* into one allow;
 it can never override a deny (the policy runs first).
 """
@@ -192,10 +194,17 @@ class EscalationStore:
             self._expire(db, now)
             approved = self._match(db, "approved", sub, tool, ahash, now)
             if approved is not None:
-                db.execute("UPDATE escalations SET status = 'consumed', consumed_at = ? WHERE id = ? AND status = 'approved'", (now, approved.id))
-                consumed = self._get(db, approved.id)
-                assert consumed is not None
-                return EscalationOutcome("allow", consumed)
+                # Allow only if this transaction moved the row approved -> consumed.
+                # (BEGIN IMMEDIATE already serializes writers; the status guard plus
+                # rowcount check also make a stale read fail closed.)
+                cur = db.execute(
+                    "UPDATE escalations SET status = 'consumed', consumed_at = ? WHERE id = ? AND status = 'approved' AND expires_at > ?",
+                    (now, approved.id, now),
+                )
+                if cur.rowcount == 1:
+                    consumed = self._get(db, approved.id)
+                    assert consumed is not None
+                    return EscalationOutcome("allow", consumed)
             denied = self._match(db, "denied", sub, tool, ahash, now)
             if denied is not None:
                 return EscalationOutcome("deny", denied)
@@ -235,10 +244,12 @@ class EscalationStore:
                 raise EscalationError(f"no escalation {escalation_id!r}")
             if cur.status != "pending":
                 raise EscalationError(f"escalation {escalation_id} is {cur.status}; only pending can be approved")
-            db.execute(
-                "UPDATE escalations SET status = 'approved', decided_at = ?, expires_at = ? WHERE id = ?",
+            res = db.execute(
+                "UPDATE escalations SET status = 'approved', decided_at = ?, expires_at = ? WHERE id = ? AND status = 'pending'",
                 (now, now + cur.approval_ttl, escalation_id),
             )
+            if res.rowcount != 1:
+                raise EscalationError(f"escalation {escalation_id} changed before it could be approved; re-read it")
             out = self._get(db, escalation_id)
         assert out is not None
         return out
@@ -252,10 +263,12 @@ class EscalationStore:
                 raise EscalationError(f"no escalation {escalation_id!r}")
             if cur.status not in ("pending", "approved"):
                 raise EscalationError(f"escalation {escalation_id} is {cur.status}; only pending or approved can be denied")
-            db.execute(
-                "UPDATE escalations SET status = 'denied', decided_at = ?, expires_at = ? WHERE id = ?",
+            res = db.execute(
+                "UPDATE escalations SET status = 'denied', decided_at = ?, expires_at = ? WHERE id = ? AND status IN ('pending','approved')",
                 (now, now + cur.pending_ttl, escalation_id),
             )
+            if res.rowcount != 1:
+                raise EscalationError(f"escalation {escalation_id} changed before it could be denied; re-read it")
             out = self._get(db, escalation_id)
         assert out is not None
         return out

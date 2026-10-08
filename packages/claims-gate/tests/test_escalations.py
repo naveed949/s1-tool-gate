@@ -158,3 +158,136 @@ def test_cli_list_approve_deny(tmp_path: Path, capsys: pytest.CaptureFixture[str
     assert "denied" in capsys.readouterr().err
     monkeypatch.delenv("S1_ESCALATION_DIR")
     assert main(["escalations", "list"]) == 2
+
+
+# ---- approve-once under concurrency ------------------------------------------
+
+N_RETRIES = 12
+
+
+def _race(store_dir: Path, barrier: Any, results: Any) -> None:
+    """One retry: own store object (like a separate proxy process), released together."""
+    s = EscalationStore(store_dir)
+    barrier.wait(timeout=30)
+    try:
+        results.put(s.on_escalate("alice", "generate_wallet", H, "claims_wallet_escalate").action)
+    except Exception as err:  # noqa: BLE001 - surfaced as a non-action result
+        results.put(f"error:{type(err).__name__}:{err}")
+
+
+@pytest.fixture
+def widen_race(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sleep between reading the approved row and updating it, so racing retries overlap.
+
+    Without this the transactions are too short to interleave reliably and a broken
+    lock (deferred BEGIN) would go unnoticed.
+    """
+    import time as _time
+
+    real = EscalationStore._match
+
+    def slow_match(self: EscalationStore, db: Any, status: str, *a: Any) -> Any:
+        row = real(self, db, status, *a)
+        if status == "approved":
+            _time.sleep(0.03)
+        return row
+
+    monkeypatch.setattr(EscalationStore, "_match", slow_match)
+
+
+def _assert_one_allow(store_dir: Path, eid: str, actions: list[str]) -> None:
+    assert sorted(actions) == ["allow"] + ["escalate"] * (N_RETRIES - 1), actions
+    s = EscalationStore(store_dir)
+    assert s.get(eid).status == "consumed"
+    rows = s.list()
+    # the losers share one fresh pending request; nothing else was approved or consumed
+    assert sorted(r.status for r in rows) == ["consumed", "pending"], [(r.id, r.status) for r in rows]
+
+
+def test_concurrent_identical_retries_threads_consume_one_approval(tmp_path: Path, widen_race: None) -> None:
+    import queue
+    import threading
+
+    d = tmp_path / "esc"
+    shared = EscalationStore(d)
+    eid = shared.on_escalate("alice", "generate_wallet", H, "claims_wallet_escalate").escalation.id
+    shared.approve(eid)
+    barrier = threading.Barrier(N_RETRIES)
+    results: queue.Queue[str] = queue.Queue()
+    threads = [threading.Thread(target=_race, args=(d, barrier, results)) for _ in range(N_RETRIES)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    _assert_one_allow(d, eid, [results.get_nowait() for _ in range(N_RETRIES)])
+
+
+def test_concurrent_identical_retries_processes_consume_one_approval(tmp_path: Path, widen_race: None) -> None:
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("fork")
+    d = tmp_path / "esc"
+    s = EscalationStore(d)
+    eid = s.on_escalate("alice", "generate_wallet", H, "claims_wallet_escalate").escalation.id
+    s.approve(eid)
+    barrier = ctx.Barrier(N_RETRIES)
+    results = ctx.Queue()
+    procs = [ctx.Process(target=_race, args=(d, barrier, results)) for _ in range(N_RETRIES)]
+    for p in procs:
+        p.start()
+    actions = [results.get(timeout=60) for _ in range(N_RETRIES)]
+    for p in procs:
+        p.join(timeout=30)
+        assert p.exitcode == 0
+    _assert_one_allow(d, eid, actions)
+
+
+def test_consume_requires_exactly_one_row_updated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stale 'approved' match (row already consumed) must not be allowed again."""
+    import dataclasses
+
+    clock = Clock()
+    s = store(tmp_path, clock)
+    e = s.on_escalate("alice", "generate_wallet", H, "r").escalation
+    s.approve(e.id)
+    assert s.on_escalate("alice", "generate_wallet", H, "r").action == "allow"
+    real_match = s._match
+
+    def stale_match(db: Any, status: str, *a: Any) -> Any:
+        if status == "approved":  # pretend the read raced the other consumer
+            return dataclasses.replace(s._get(db, e.id), status="approved")
+        return real_match(db, status, *a)
+
+    monkeypatch.setattr(s, "_match", stale_match)
+    out = s.on_escalate("alice", "generate_wallet", H, "r")
+    assert out.action == "escalate" and out.escalation.id != e.id
+    monkeypatch.undo()
+    assert s.get(e.id).status == "consumed"
+
+
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+def test_decisions_guard_on_current_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decision: str) -> None:
+    """approve/deny UPDATEs carry a status guard: a stale read can never re-arm or rewrite a consumed row."""
+    import dataclasses
+
+    clock = Clock()
+    s = store(tmp_path, clock)
+    e = s.on_escalate("alice", "generate_wallet", H, "r").escalation
+    s.approve(e.id)
+    s.on_escalate("alice", "generate_wallet", H, "r")  # consumed
+    real_get = s._get
+    seen = {"n": 0}
+
+    def stale_get(db: Any, escalation_id: str) -> Any:
+        row = real_get(db, escalation_id)
+        seen["n"] += 1
+        if seen["n"] == 1:  # the pre-update state check sees a stale row
+            return dataclasses.replace(row, status="pending")
+        return row
+
+    monkeypatch.setattr(s, "_get", stale_get)
+    with pytest.raises(EscalationError, match="changed"):
+        getattr(s, decision)(e.id)
+    monkeypatch.undo()
+    assert s.get(e.id).status == "consumed"
+    assert s.on_escalate("alice", "generate_wallet", H, "r").action == "escalate"
