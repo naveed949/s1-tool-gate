@@ -250,14 +250,14 @@ def test_concurrent_identical_retries_processes_consume_one_approval(tmp_path: P
 
 
 class _MutatedDb:
-    """sqlite connection whose SQL is rewritten: deferred or no transaction, unguarded consume."""
+    """sqlite connection whose SQL is rewritten: deferred or no transaction, optionally unguarded consume."""
 
     def __init__(self, db: Any, mode: str) -> None:
         self._db, self._mode = db, mode
 
     def execute(self, sql: str, params: Any = ()) -> Any:
         stmt = sql.strip()
-        if stmt.startswith("UPDATE escalations SET status = 'consumed'"):
+        if stmt.startswith("UPDATE escalations SET status = 'consumed'") and self._mode != "deferred-guarded":
             sql, params = "UPDATE escalations SET status = 'consumed', consumed_at = ? WHERE id = ?", params[:2]
         elif stmt in ("BEGIN IMMEDIATE", "COMMIT", "ROLLBACK") and self._mode == "no-transaction":
             sql, params = "SELECT 1", ()
@@ -269,12 +269,12 @@ class _MutatedDb:
         self._db.close()
 
 
-@pytest.mark.parametrize("mode", ["deferred-unguarded", "no-transaction"])
+@pytest.mark.parametrize("mode", ["deferred-guarded", "deferred-unguarded", "no-transaction"])
 def test_widen_race_mutations_behave_as_documented(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, widen_race: None, mode: str) -> None:
     """What the widen_race docstring says about weaker variants, measured.
 
-    deferred BEGIN + unguarded consume: one allow, the rest 'database is locked'
-    (the proxy denies those), never two allows. No transaction + unguarded consume:
+    deferred BEGIN, with or without the status-guarded consume: one allow, the rest
+    'database is locked' (the proxy denies those), never two allows. No transaction + unguarded consume:
     more than one allow, which is what the concurrent-retry tests exist to catch.
     """
     import queue
@@ -296,7 +296,7 @@ def test_widen_race_mutations_behave_as_documented(tmp_path: Path, monkeypatch: 
         t.join(timeout=60)
     actions = [results.get_nowait() for _ in range(N_RETRIES)]
     allows = actions.count("allow")
-    if mode == "deferred-unguarded":
+    if mode.startswith("deferred-"):
         assert allows == 1, actions
         others = [a for a in actions if a != "allow"]
         assert set(others) <= {"escalate", "error:OperationalError:database is locked"}, actions
