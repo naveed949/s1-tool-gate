@@ -50,7 +50,7 @@ The fixture is copied by hand. A tool kaia-mcp adds later is denied (`claims_unk
 **Drift guard.** The gate keeps owning its map. It does not take policy from the server it guards. Instead, the live proxy fetches kaia-mcp's published map (`GET /.well-known/kaia-mcp/tool-scopes`, added in naveed949/kaia-mcp#3) and compares it with its own:
 
 - At startup, the proxy **refuses to start** (exit 3) if any tool or scope differs, or if the map cannot be fetched.
-- While serving, it rechecks every `--drift-interval` seconds (default 60). If the maps differ, or the fetch fails, it **fails closed**: every `tools/call` is denied with `-32050` `claims_tool_scope_drift`, and `error.data.drift` carries the diff or the fetch error. This lasts until a recheck matches again. Other MCP traffic (`initialize`, `tools/list`, …) still needs only a valid token.
+- While serving, it rechecks once as soon as it starts listening and then every `--drift-interval` seconds (default 60). A negative interval is refused at startup (exit 3). If the maps differ, or the fetch fails, it **fails closed**: every `tools/call` is denied with `-32050` `claims_tool_scope_drift`, and `error.data.drift` carries the diff or the fetch error. This lasts until a recheck matches again. Other MCP traffic (`initialize`, `tools/list`, …) still needs only a valid token.
   - Each transition (`ok -> drift`, `drift -> ok`) is logged at WARNING and written to the audit log as `drift_failing` / `drift_recovered`.
   - `GET /health` reports `toolScopes: {ok, checkedAt, intervalSeconds, url}`.
 - `--drift-interval 0` keeps only the startup check. `--no-drift-check` turns off both checks, for upstreams that do not publish the map.
@@ -110,7 +110,8 @@ python -m claims_gate proxy --upstream http://127.0.0.1:3100 \
 - JSON-RPC **batches are rejected** (`claims_malformed_request`), so a batch cannot hide a `tools/call`.
 - **No token is logged.** Each decision is one log line and, with `--audit-log`, one JSON line with `event`, `reasonCode`, `tool`, `subject`, `forwarded`, and a 12-char token fingerprint.
 - `GET /health` and `GET /.well-known/oauth-protected-resource` are served by the proxy itself. The latter points `authorization_servers` at the issuer.
-- **Startup is fail-closed.** Discovery, JWKS, introspection credentials, the escalation queue (if configured), and the drift check must all pass. Otherwise the proxy prints the reason and exits 3 without listening. After startup, the drift check keeps running (see **Drift guard** above).
+- The proxy listens with a backlog of 128 (capped by the kernel's `somaxconn`), so a burst of concurrent clients is queued rather than dropped. Each connection is handled on its own thread.
+- **Startup is fail-closed.** Discovery, JWKS, introspection credentials, the escalation queue (if configured), the drift check, and every setting (for example a negative `--drift-interval`) must all pass. Otherwise the proxy prints the reason and exits 3 without listening. After startup, the drift check keeps running (see **Drift guard** above).
 
 ### Escalation queue
 
@@ -164,7 +165,7 @@ Approval only turns an *escalate* into one allow. The claims policy runs first, 
 - The proxy refuses to start on a missing or changed tool-scope map.
 - While running with `--drift-interval 1`, a map change makes the proxy deny `tools/call` with `claims_tool_scope_drift`, and restoring the map lets calls through again.
 - No token appears in any log.
-- **Optional:** a `get_block_number` read returns live mainnet data. It needs the public Kaia RPC (`KAIA_RPC_URL`, default `https://public-en.node.kaia.io`). The harness probes the RPC first, and again if the call fails. If the RPC is unreachable, the check is reported as `SKIP` and the run does not fail.
+- **Optional:** a `get_block_number` read returns live mainnet data. It needs the public Kaia RPC (`KAIA_RPC_URL`, default `https://public-en.node.kaia.io`). The harness probes the RPC with `eth_blockNumber` before the call. Only if that probe fails is the check reported as `SKIP` (the run does not fail). Once the `tools/call` has run, any failure is a `FAIL`; the RPC is not re-probed, so an outage after the call can never turn a gate bug into a SKIP.
 
 It writes `summary.json` (`passed`/`failed`/`skipped`/`total`, and a `result` of `PASS`/`FAIL`/`SKIP` per check) plus all logs to `--evidence-dir`. It exits 0 only if no check failed. Only `allow-read` may SKIP; a required check can never SKIP. CI runs it in the `claims-gate-live-proxy` job. It needs GitHub access for the clone. The Kaia RPC is needed only for the optional read.
 
