@@ -94,12 +94,12 @@ It targets kaia-mcp `00f3511` or later (MCP 2026-07-28, stateless). See [Audienc
 
 - **Every request** on the MCP path needs a bearer token that verifies against the issuer's JWKS, with the **pinned** issuer and audience. That includes `initialize`, `tools/list`, notifications, `GET`, and `DELETE`.
   - The JWKS comes from the discovery `jwks_uri`. Discovery's `issuer` must equal `--issuer`, and the `jwks_uri` must be on the issuer's origin unless you pass `--jwks-uri`.
-  - The JWKS is cached (`--jwks-ttl`, default 300s). A token with an unknown `kid` triggers a refetch, at most once every 10s. A cache past its TTL whose refetch fails denies with `claims_jwks_unavailable`.
+  - The JWKS is cached (`--jwks-ttl`, default 300s, at most 3600s: a key removed from the JWKS stays trusted until the next refresh). A token with an unknown `kid` triggers a refetch, at most once every 10s. A cache past its TTL whose refetch fails denies with `claims_jwks_unavailable`.
   - A token failure gets HTTP 401 with `WWW-Authenticate: Bearer … resource_metadata=…` and a JSON-RPC error.
 - **Introspection** (optional): `--introspection auto` (the discovery `introspection_endpoint`) or a URL. It uses RFC 7662 with `client_secret_basic`, and credentials come only from `S1_INTROSPECTION_CLIENT_ID` / `S1_INTROSPECTION_CLIENT_SECRET`.
   - It is called after the JWT checks pass, on **every request** by default. Caching `active: true` answers is opt-in (see below).
   - `active: false` → `claims_token_revoked`. An unreachable or broken endpoint → `claims_introspection_unavailable`. It fails closed.
-  - **Cache (off by default).** `--introspection-cache-ttl` defaults to `0`: nothing is cached, every request is introspected, and a token revoked at the IdP is denied on the very next request. To enable the cache, pass a positive number of seconds, e.g. `--introspection-cache-ttl 5`. With a TTL set:
+  - **Cache (off by default).** `--introspection-cache-ttl` defaults to `0`: nothing is cached, every request is introspected, and a token revoked at the IdP is denied on the very next request. To enable the cache, pass a positive number of seconds up to `300`, e.g. `--introspection-cache-ttl 5`. Larger values are refused at startup: the TTL is the revocation latency at the proxy, and a huge value (`1e300`) would cache an answer until token `exp`. With a TTL set:
     - Only `active: true` answers are cached. The key is the token's sha256, never the token itself. An entry lives until `min(now + TTL, token exp)`.
     - `active: false`, HTTP errors, timeouts, and malformed answers are **never cached**. Every one of them is re-asked and denied.
     - The cache holds at most 10,000 entries. When full it drops expired entries, then clears itself (a miss only costs one introspection call).
@@ -108,13 +108,24 @@ It targets kaia-mcp `00f3511` or later (MCP 2026-07-28, stateless). See [Audienc
 - **`tools/call`** runs the claims policy:
   - **deny** → JSON-RPC error `-32050`, `data: {reasonCode, choice, tool, requiredScope}`. Not forwarded.
   - **escalate** (`generate_wallet`) → JSON-RPC error `-32051`, `data: {reasonCode: "claims_wallet_escalate", escalationId, escalationStatus, …}`. Not forwarded. With `--escalation-dir` a human can approve one retry (see [Escalation queue](#escalation-queue)).
-  - **allow** → the request body is forwarded byte-for-byte with its headers, including `Authorization`, but never `Mcp-Session-Id` (see below). The response, including SSE, is streamed back.
+  - **allow** → the request body is forwarded byte-for-byte with its headers, line for line, but never `Mcp-Session-Id` (see below). The `Authorization` sent upstream is exactly the value the proxy verified. The response, including SSE, is streamed back.
   - Decisions use the JSON-RPC body, which is what kaia-mcp executes. `Mcp-Method` / `Mcp-Name` headers are forwarded unchanged but never trusted.
 - JSON-RPC **batches are rejected** (`claims_malformed_request`), so a batch cannot hide a `tools/call`.
+- **Ambiguous headers are rejected** before the token is checked: HTTP 400, JSON-RPC `-32600`, `claims_malformed_request`, `data.header`, audited as a `deny` and never forwarded. That covers more than one `Authorization`, `Host`, `Content-Length`, `Content-Type`, `Origin`, `Mcp-Method`, `Mcp-Name`, or `MCP-Protocol-Version` line, and a comma-joined `Authorization` value. Otherwise the proxy could verify one token (the first line) while kaia-mcp runs the call with another (the last).
 - **No token is logged.** Each decision is one log line and, with `--audit-log`, one JSON line with `event`, `reasonCode`, `tool`, `subject`, `forwarded`, and a 12-char token fingerprint.
 - `GET /health` and `GET /.well-known/oauth-protected-resource` are served by the proxy itself. The latter points `authorization_servers` at the issuer.
 - The proxy listens with a backlog of 128 (capped by the kernel's `somaxconn`), so a burst of concurrent clients is queued rather than dropped. Each connection is handled on its own thread.
-- **Startup is fail-closed.** Discovery, JWKS, introspection credentials, the escalation queue (if configured), the drift check, and every setting must all pass. For example, `--drift-interval` must be finite and in `[0, threading.TIMEOUT_MAX]`, `--jwks-ttl` and the escalation TTLs finite and positive, and `--introspection-cache-ttl` finite and `>= 0`. Otherwise the proxy prints the reason and exits 3 without listening. After startup, the drift check keeps running (see **Drift guard** above).
+- **Startup is fail-closed.** Discovery, JWKS, introspection credentials, the escalation queue (if configured), the drift check, and every setting must all pass. Every duration needs a finite value **with an upper bound**, because a huge value such as `1e300` behaves like `inf`:
+
+  | Flag | Allowed (seconds) | Why the cap |
+  | --- | --- | --- |
+  | `--drift-interval` | `[0, threading.TIMEOUT_MAX]` (0 = startup only) | larger values overflow the recheck timer |
+  | `--introspection-cache-ttl` | `[0, 300]` | it is the revocation latency at the proxy |
+  | `--jwks-ttl` | `(0, 3600]` | a key removed from the JWKS keeps working until the refresh |
+  | `--escalation-pending-ttl` | `(0, 86400]` | one day of human review; also how long a deny sticks; after it a retry re-asks |
+  | `--escalation-approval-ttl` | `(0, 3600]` | an approval is for the caller's immediate retry |
+
+  The escalation TTLs are checked even without `--escalation-dir`. Otherwise the proxy prints the reason and exits 3 without listening. After startup, the drift check keeps running (see **Drift guard** above).
 
 ### Audience and kaia's canonical URL
 
@@ -135,7 +146,7 @@ Since kaia-mcp `00f3511` (naveed949/kaia-mcp#6, RFC 8707), every access token ka
 
 Without `--escalation-dir` (or `S1_ESCALATION_DIR`) an escalation is terminal: `-32051` with a random `escalationId` and `escalationStatus: "not_queued"`, and nothing can approve it.
 
-With it, the proxy records every escalation in `<dir>/escalations.sqlite3` (dir mode `700`, file `600`). If the file (or the directory) is deleted while the proxy runs, the next queue access recreates it empty with the same modes, whatever the process umask (sqlite opens it read-write only and never creates it itself). Nothing approved survives, so the next escalation is a fresh `pending` request. Every queue transaction first runs `CREATE TABLE IF NOT EXISTS`, so requests racing that recreation escalate normally (one shared `pending` row) instead of failing with `claims_escalation_unavailable`. One row per request:
+With it, the proxy records every escalation in `<dir>/escalations.sqlite3` (dir mode `700`, file `600`). If the file (or the directory) is deleted while the proxy runs, the next queue access recreates it empty with the same modes, whatever the process umask (sqlite opens it read-write only and never creates it itself). Nothing approved survives, so the next escalation is a fresh `pending` request. Every queue transaction first runs `CREATE TABLE IF NOT EXISTS`, so requests racing that recreation escalate normally (one shared `pending` row) instead of failing with `claims_escalation_unavailable`. A request that races the deletion itself (the file vanishes between the proxy's check and sqlite opening it) still fails closed with `claims_escalation_unavailable`; its retry escalates normally. One row per request:
 
 | Field | Meaning |
 | --- | --- |
@@ -147,7 +158,7 @@ With it, the proxy records every escalation in `<dir>/escalations.sqlite3` (dir 
 | `status` | `pending` → `approved` → `consumed`, or `denied`, or `expired` |
 | `createdAt`, `decidedAt`, `consumedAt` | unix seconds |
 | `expiresAt` | pending: decide before this; approved: retry before this; denied: identical retries denied until this |
-| `pendingTtl`, `approvalTtl` | fixed by the proxy when the row is created (`--escalation-pending-ttl`, default 3600s; `--escalation-approval-ttl`, default 300s) |
+| `pendingTtl`, `approvalTtl` | fixed by the proxy when the row is created (`--escalation-pending-ttl`, default 3600s, max 86400s; `--escalation-approval-ttl`, default 300s, max 3600s) |
 
 ```bash
 python -m claims_gate escalations list [--status pending] --dir /var/lib/s1/escalations

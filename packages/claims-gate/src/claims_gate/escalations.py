@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import secrets
 import sqlite3
@@ -53,9 +52,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from claims_gate.durations import duration_error
+
 DB_FILENAME = "escalations.sqlite3"
 DEFAULT_PENDING_TTL = 3600.0
 DEFAULT_APPROVAL_TTL = 300.0
+# Upper bounds (a huge finite TTL is a pending request, deny, or approval that never
+# expires). Pending: one day is a full review window for a human; after it a retry
+# simply re-asks (a fresh pending row, never an allow), and a deny sticks this long.
+MAX_PENDING_TTL = 86400.0
+# Approval: an approval is a one-shot for the caller's *immediate* retry (default 5 min);
+# an hour covers a slow retry loop without leaving an approved call usable for long.
+MAX_APPROVAL_TTL = 3600.0
 STATUSES = ("pending", "approved", "denied", "expired", "consumed")
 
 Action = Literal["allow", "escalate", "deny"]
@@ -83,6 +91,18 @@ _COLUMNS = "id, sub, tool, args_hash, reason_code, status, created_at, expires_a
 
 class EscalationError(Exception):
     """An approve/deny that is not allowed from the escalation's current state."""
+
+
+def ttl_errors(pending_ttl: float, approval_ttl: float) -> list[str]:
+    """Every out-of-range escalation TTL, as error text (empty if both are fine)."""
+    return [
+        e
+        for e in (
+            duration_error("escalation pending TTL", pending_ttl, maximum=MAX_PENDING_TTL),
+            duration_error("escalation approval TTL", approval_ttl, maximum=MAX_APPROVAL_TTL),
+        )
+        if e is not None
+    ]
 
 
 def args_hash(arguments: Any) -> str:
@@ -138,8 +158,9 @@ class EscalationStore:
         approval_ttl: float = DEFAULT_APPROVAL_TTL,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        if not all(math.isfinite(t) and t > 0 for t in (pending_ttl, approval_ttl)):
-            raise ValueError(f"escalation TTLs must be finite and positive (got pending={pending_ttl}, approval={approval_ttl})")
+        errors = ttl_errors(pending_ttl, approval_ttl)
+        if errors:
+            raise ValueError("; ".join(errors))
         self.directory = Path(directory)
         self.path = self.directory / DB_FILENAME
         self.pending_ttl = float(pending_ttl)
@@ -152,14 +173,13 @@ class EscalationStore:
             pass
 
     # ---- plumbing --------------------------------------------------------
-    def _create_private(self) -> bool:
+    def _create_private(self) -> None:
         """Create the dir (700) and db file (600) if missing, before sqlite can create them.
 
         sqlite would otherwise create a deleted db with the process umask (often 644).
-        Returns True if the db file was missing.
         """
         if self.path.exists():
-            return False
+            return
         if not self.directory.is_dir():
             self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             os.chmod(self.directory, 0o700)
@@ -168,7 +188,6 @@ class EscalationStore:
             os.fchmod(fd, 0o600)
         finally:
             os.close(fd)
-        return True
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:

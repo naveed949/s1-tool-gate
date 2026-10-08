@@ -23,7 +23,11 @@ decision JSON and exits 0 for any decision; exit 2 is a usage/config error.
 ``proxy`` prints its startup report as JSON, then ``ready: ...``, and serves
 until interrupted. It exits 3 without listening if discovery, the JWKS, the
 introspection setup, or the tool-scope drift check fails, or a setting is
-invalid (e.g. a negative ``--drift-interval``) (fail closed).
+out of range (fail closed). Every duration must be a finite number of seconds
+with an upper bound: ``--drift-interval`` in ``[0, threading.TIMEOUT_MAX]``,
+``--introspection-cache-ttl`` in ``[0, 300]``, ``--jwks-ttl`` in ``(0, 3600]``,
+``--escalation-pending-ttl`` in ``(0, 86400]``, ``--escalation-approval-ttl`` in
+``(0, 3600]`` (a huge value such as ``1e300`` behaves like ``inf``).
 While serving it rechecks the tool-scope map once when it starts listening and
 then every ``--drift-interval`` seconds (default 60; 0 = startup only) and denies every ``tools/call`` while
 the maps differ or the map cannot be fetched.
@@ -148,6 +152,13 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
             with lock, audit_path.open("a") as fh:
                 fh.write(json.dumps(record, sort_keys=True) + "\n")
 
+    from claims_gate.escalations import ttl_errors
+
+    # Checked even without --escalation-dir: an out-of-range setting is a startup error.
+    bad_ttls = ttl_errors(args.escalation_pending_ttl, args.escalation_approval_ttl)
+    if bad_ttls:
+        print("claims_gate proxy: refusing to start (fail closed): " + "; ".join(bad_ttls), file=sys.stderr, flush=True)
+        return 3
     escalations = None
     if args.escalation_dir:
         from claims_gate.escalations import EscalationStore
@@ -231,9 +242,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_proxy.add_argument("--issuer", required=True, help="pinned token issuer (exact match)")
     p_proxy.add_argument("--audience", required=True, help="pinned token audience")
     p_proxy.add_argument("--jwks-uri", help="override discovery's jwks_uri (also allows a different origin)")
-    p_proxy.add_argument("--jwks-ttl", type=float, default=300.0)
+    p_proxy.add_argument("--jwks-ttl", type=float, default=300.0, help="seconds to cache the JWKS (0 < S <= 3600); an unknown kid refetches sooner")
     p_proxy.add_argument("--introspection", help="'auto' (discovery) or an RFC 7662 URL; credentials from S1_INTROSPECTION_CLIENT_ID/SECRET")
-    p_proxy.add_argument("--introspection-cache-ttl", type=float, default=0.0, help="opt-in: seconds to cache active=true introspection answers (bounded by token exp). Default 0 = off, every request is introspected and a revocation applies on the next request. With a TTL, a revoked token stays usable at the proxy for up to that long")
+    p_proxy.add_argument("--introspection-cache-ttl", type=float, default=0.0, help="opt-in: seconds to cache active=true introspection answers (bounded by token exp). Default 0 = off, every request is introspected and a revocation applies on the next request. With a TTL, a revoked token stays usable at the proxy for up to that long. At most 300")
     p_proxy.add_argument("--tool-scopes-url", help="default: <upstream>/.well-known/kaia-mcp/tool-scopes")
     p_proxy.add_argument("--no-drift-check", action="store_true", help="skip the tool-scope drift check entirely (not recommended)")
     p_proxy.add_argument("--drift-interval", type=float, default=60.0, help="seconds between tool-scope map rechecks while serving; drift or fetch failure denies every tools/call until fixed (0 = startup check only; negative = refuse to start)")
@@ -243,8 +254,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_proxy.add_argument("--audit-log", help="append one JSON line per decision (no tokens)")
     p_proxy.add_argument("--wallet-default", choices=["escalate", "deny"], default="escalate")
     p_proxy.add_argument("--escalation-dir", default=os.environ.get("S1_ESCALATION_DIR") or None, help="durable escalation queue (sqlite) so humans can approve one retry; default $S1_ESCALATION_DIR; unset = escalations are terminal")
-    p_proxy.add_argument("--escalation-pending-ttl", type=float, default=3600.0, help="seconds a pending escalation waits for a human (also how long a deny sticks)")
-    p_proxy.add_argument("--escalation-approval-ttl", type=float, default=300.0, help="seconds an approval stays usable for its one retry")
+    p_proxy.add_argument("--escalation-pending-ttl", type=float, default=3600.0, help="seconds a pending escalation waits for a human (also how long a deny sticks); 0 < S <= 86400")
+    p_proxy.add_argument("--escalation-approval-ttl", type=float, default=300.0, help="seconds an approval stays usable for its one retry; 0 < S <= 3600")
     p_proxy.set_defaults(func=_cmd_proxy)
 
     p_esc = sub.add_parser("escalations", help="list, approve, or deny queued escalations")

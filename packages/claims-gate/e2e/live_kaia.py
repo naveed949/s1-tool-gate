@@ -423,6 +423,9 @@ def main() -> int:
 
         mcp = Mcp(proxy_url, access)
         st, body = mcp.initialize()
+        # kaia-mcp >= 00f3511 never sends Mcp-Session-Id, so "no session" here shows the
+        # stateless path works end to end; it cannot catch the proxy *relaying* one.
+        # That is pinned offline (test_allow_forwards_body_and_auth_unchanged_without_a_session).
         r.check("initialize-through-proxy", st == 200 and not mcp.session, status=st, sessionId=bool(mcp.session))
 
         st, body = mcp.call("encode_function_data", BALANCE_OF_ARGS)

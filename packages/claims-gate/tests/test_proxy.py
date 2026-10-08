@@ -242,7 +242,7 @@ def test_decision_uses_the_body_not_mcp_name_headers(rig_factory: Any) -> None:
     assert rig.fake.mcp_requests == []
 
 
-# Captured from kaia-mcp 00f3511 (S2 evidence kaia-probe/probe.json), port normalized.
+# Captured live from kaia-mcp 00f3511 (a token without kaia:encode calling encode_function_data), port normalized.
 KAIA_403_WWW = (
     'Bearer realm="kaia-mcp", error="insufficient_scope", scope="kaia:encode", '
     'resource_metadata="http://127.0.0.1:3100/.well-known/oauth-protected-resource", '
@@ -769,7 +769,7 @@ def test_drift_monitor_rejects_bad_intervals(bad: float) -> None:
         DriftMonitor("http://x/tool-scopes", KAIA_TOOL_SCOPES, interval=bad, fetch=lambda url, **_: (200, {}))
 
 
-@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0, 3600.001, 1e300, 9e18])
 def test_build_config_rejects_bad_jwks_ttl(bad: float) -> None:
     signer = TestSigner.generate()
     issuer = "http://idp.test:1"
@@ -782,10 +782,36 @@ def test_build_config_rejects_bad_jwks_ttl(bad: float) -> None:
         return 200, signer.jwks()
 
     cfg, rep = build_config(upstream=issuer, issuer=issuer, audience="kaia-mcp", policy=kaia_policy(), fetch=fetch, jwks_ttl_seconds=bad)
-    assert cfg is None and any("jwks TTL" in e for e in rep.errors), rep.errors
+    assert cfg is None and [e for e in rep.errors if "jwks TTL" in e] == [f"jwks TTL must be a finite number in (0, 3600.0] seconds (got {bad})"], rep.errors
+    with pytest.raises(ValueError):
+        JwksCache("http://idp/jwks", ttl_seconds=bad)
+    cfg, rep = build_config(upstream=issuer, issuer=issuer, audience="kaia-mcp", policy=kaia_policy(), fetch=fetch, jwks_ttl_seconds=3600.0)
+    assert cfg is not None, rep.errors
 
 
-@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1.0])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1.0, 300.001, 1e300, 9e18])
+def test_build_config_reports_a_bad_introspection_cache_ttl_once(bad: float) -> None:
+    """A huge TTL is inf in practice (cached until token exp: revocation never applies at the proxy)."""
+    signer = TestSigner.generate()
+    issuer = "http://idp.test:1"
+
+    def fetch(url: str, **_: Any) -> tuple[int, Any]:
+        if url.endswith("/openid-configuration"):
+            return 200, {"issuer": issuer, "jwks_uri": issuer + "/jwks", "introspection_endpoint": issuer + "/introspect"}
+        if url.endswith("/tool-scopes"):
+            return 200, {"tool_scopes": dict(KAIA_TOOL_SCOPES)}
+        return 200, signer.jwks()
+
+    kw: dict[str, Any] = {"upstream": issuer, "issuer": issuer, "audience": "kaia-mcp", "policy": kaia_policy(), "fetch": fetch}
+    for intro in (None, "auto"):
+        cfg, rep = build_config(**kw, introspection=intro, introspection_client_id="c", introspection_client_secret="s", introspection_cache_ttl=bad)
+        assert cfg is None
+        assert [e for e in rep.errors if "introspection cache TTL" in e] == [f"introspection cache TTL must be a finite number in [0, 300.0] seconds (got {bad})"], rep.errors
+    cfg, rep = build_config(**kw, introspection="auto", introspection_client_id="c", introspection_client_secret="s", introspection_cache_ttl=300.0)
+    assert cfg is not None and cfg.introspector is not None and cfg.introspector.cache_ttl == 300.0, rep.errors
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1.0, 300.001, 1e300, 9e18])
 def test_introspection_cache_ttl_must_be_finite(bad: float) -> None:
     """inf would cache an active answer until token exp: a revocation would never apply at the proxy."""
     with pytest.raises(ValueError):
@@ -970,3 +996,117 @@ def test_proxy_serves_20_concurrent_requests_without_resets(rig_factory: Any) ->
         t.join(timeout=30)
     assert results == [200] * BURST, results
     assert len(rig.fake.mcp_requests) == BURST
+
+
+# ---- ambiguous (duplicated) auth-relevant headers ------------------------------
+
+
+def _raw_post(port: int, headers: list[tuple[str, str]], body: bytes) -> tuple[int, dict[str, str], bytes]:
+    """POST with exactly these header lines (duplicates kept), plus Content-Length unless given."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.putrequest("POST", "/", skip_host=any(k.lower() == "host" for k, _ in headers), skip_accept_encoding=True)
+    for k, v in headers:
+        conn.putheader(k, v)
+    if not any(k.lower() == "content-length" for k, _ in headers):
+        conn.putheader("Content-Length", str(len(body)))
+    conn.endheaders(body)
+    r = conn.getresponse()
+    data = r.read()
+    conn.close()
+    return r.status, {k.lower(): v for k, v in r.getheaders()}, data
+
+
+def test_two_authorization_headers_are_refused_before_policy_and_never_forwarded(rig_factory: Any) -> None:
+    """The gate used to verify the first Authorization and forward the last (token confusion)."""
+    rig = rig_factory()
+    encode_tok, read_tok = rig.token("kaia:read kaia:encode"), rig.token("kaia:read")
+    body = json.dumps(CALL("encode_function_data", 5, BALANCE_OF_LIKE)).encode()
+    base = [("Host", "127.0.0.1"), ("Content-Type", "application/json"), ("Accept", "application/json, text/event-stream")]
+    for auths in ([encode_tok, read_tok], [read_tok, encode_tok], [encode_tok, encode_tok]):
+        status, _, data = _raw_post(rig.proxy_port, [*base, *(("Authorization", f"Bearer {t}") for t in auths)], body)
+        err = _err(data)
+        assert (status, err["data"]["reasonCode"], err["data"]["choice"]) == (400, "claims_malformed_request", "deny"), data
+        assert "Authorization" in err["message"]
+    assert rig.fake.mcp_requests == []
+    assert [a["event"] for a in rig.audit] == ["deny"] * 3
+    assert all(a["stage"] == "request" and a["forwarded"] is False and a["header"] == "Authorization" for a in rig.audit)
+    assert not any(encode_tok in json.dumps(a) or read_tok in json.dumps(a) for a in rig.audit)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["Bearer {a}, Bearer {b}", "Bearer {a},Bearer {b}", "Bearer {a},", "Basic Zm9vOmJhcg==, Bearer {a}"],
+)
+def test_comma_joined_authorization_is_refused(rig_factory: Any, value: str) -> None:
+    rig = rig_factory()
+    a, b = rig.token("kaia:read kaia:encode"), rig.token("kaia:read")
+    status, _, data = _raw_post(rig.proxy_port, [("Host", "127.0.0.1"), ("Content-Type", "application/json"), ("Authorization", value.format(a=a, b=b))], json.dumps(CALL("get_block_number")).encode())
+    assert (status, _err(data)["data"]["reasonCode"]) == (400, "claims_malformed_request")
+    assert rig.fake.mcp_requests == []
+    assert rig.audit[-1]["event"] == "deny" and rig.audit[-1]["forwarded"] is False
+
+
+@pytest.mark.parametrize(
+    ("name", "values"),
+    [
+        ("Mcp-Method", ["tools/call", "tools/list"]),
+        ("Mcp-Name", ["get_block_number", "generate_wallet"]),
+        ("MCP-Protocol-Version", ["2025-06-18", "2026-07-28"]),
+        ("Content-Type", ["application/json", "text/plain"]),
+        ("Origin", ["http://127.0.0.1", "http://evil.example"]),
+        ("Host", ["127.0.0.1", "evil.example"]),
+        ("Content-Length", None),  # two equal lengths: still ambiguous framing
+    ],
+)
+def test_duplicated_auth_relevant_headers_are_refused(rig_factory: Any, name: str, values: list[str] | None) -> None:
+    rig = rig_factory()
+    tok = rig.token("kaia:read")
+    body = json.dumps(CALL("get_block_number")).encode()
+    vals = values or [str(len(body)), str(len(body))]
+    headers = [("Authorization", f"Bearer {tok}")]
+    if name != "Host":
+        headers.append(("Host", "127.0.0.1"))
+    if name != "Content-Type":
+        headers.append(("Content-Type", "application/json"))
+    headers += [(name, v) for v in vals]
+    status, _, data = _raw_post(rig.proxy_port, headers, body)
+    err = _err(data)
+    assert (status, err["data"]["reasonCode"]) == (400, "claims_malformed_request"), data
+    assert name.lower() in err["message"].lower()
+    assert rig.fake.mcp_requests == []
+    assert rig.audit[-1]["event"] == "deny" and rig.audit[-1]["header"].lower() == name.lower()
+
+
+def test_forwarded_authorization_is_exactly_the_authenticated_value(rig_factory: Any) -> None:
+    """One header line in, the same value out (after the gate's own parsing), and only one."""
+    rig = rig_factory()
+    tok = rig.token("kaia:read")
+    status, _, _ = _raw_post(rig.proxy_port, [("Host", "127.0.0.1"), ("Content-Type", "application/json"), ("Authorization", f"Bearer {tok}"), ("Accept", "application/json"), ("Accept", "text/event-stream")], json.dumps(CALL("get_block_number")).encode())
+    assert status == 200
+    [seen] = rig.fake.mcp_requests
+    assert seen["headers"]["Authorization"] == f"Bearer {tok}"
+
+
+def test_forwarded_headers_keep_each_line_and_one_authorization(rig_factory: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unrelated repeated headers are relayed line for line (not collapsed to the last one)."""
+    targets: dict[int, tuple[int, str]] = {}
+    sent: dict[int, list[tuple[str, str]]] = {}
+    real_putrequest, real_putheader = http.client.HTTPConnection.putrequest, http.client.HTTPConnection.putheader
+
+    def spy_putrequest(self: http.client.HTTPConnection, method: str, url: str, *a: Any, **kw: Any) -> None:
+        targets[id(self)] = (self.port or 0, url)
+        real_putrequest(self, method, url, *a, **kw)
+
+    def spy_putheader(self: http.client.HTTPConnection, header: str, *values: Any) -> None:
+        sent.setdefault(id(self), []).append((header, str(values[0]) if values else ""))
+        real_putheader(self, header, *values)
+
+    rig = rig_factory()
+    tok = rig.token("kaia:read")
+    monkeypatch.setattr(http.client.HTTPConnection, "putrequest", spy_putrequest)
+    monkeypatch.setattr(http.client.HTTPConnection, "putheader", spy_putheader)
+    status, _, _ = _raw_post(rig.proxy_port, [("Host", "127.0.0.1"), ("Content-Type", "application/json"), ("Authorization", f"Bearer {tok}"), ("Accept", "application/json"), ("Accept", "text/event-stream")], json.dumps(CALL("get_block_number")).encode())
+    assert status == 200
+    [upstream] = [sent[c] for c, (port, url) in targets.items() if port != rig.proxy_port and url == "/"]
+    assert [v for k, v in upstream if k.lower() == "authorization"] == [f"Bearer {tok}"]
+    assert [v for k, v in upstream if k.lower() == "accept"] == ["application/json", "text/event-stream"]

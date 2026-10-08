@@ -180,15 +180,14 @@ def widen_race(monkeypatch: pytest.MonkeyPatch) -> None:
     """Sleep between reading the approved row and updating it, so racing retries overlap.
 
     Without the sleep the transactions are too short to interleave reliably. What the
-    two tests below then catch (mutation-checked, see the S2 evidence): dropping the
-    write lock *and* the guarded consume together (no transaction, or a deferred
-    transaction whose first write comes after the read, plus an unguarded UPDATE)
-    lets more than one retry through. They do not prove ``BEGIN IMMEDIATE`` on its
-    own is needed: a deferred ``BEGIN`` whose first statement is a write is just as
-    serialized, and with the schema statement first (a read once the table exists)
-    a deferred ``BEGIN`` shows up here only as ``database is locked`` errors, which
-    the proxy turns into a deny. The status guard plus rowcount check is pinned
-    separately by ``test_consume_requires_exactly_one_row_updated``.
+    two tests below then catch: dropping the transaction *and* the guarded consume
+    together (no transaction at all, plus an unguarded UPDATE) lets more than one
+    retry through. They do not prove ``BEGIN IMMEDIATE`` on its own is needed: with a
+    deferred ``BEGIN`` (guarded or not) one retry is allowed and the others fail with
+    ``database is locked``, which the proxy turns into a deny, never a second allow.
+    Both claims are pinned by ``test_widen_race_mutations_behave_as_documented``; the
+    status guard plus rowcount check is pinned separately by
+    ``test_consume_requires_exactly_one_row_updated``.
     """
     import time as _time
 
@@ -248,6 +247,62 @@ def test_concurrent_identical_retries_processes_consume_one_approval(tmp_path: P
         p.join(timeout=30)
         assert p.exitcode == 0
     _assert_one_allow(d, eid, actions)
+
+
+class _MutatedDb:
+    """sqlite connection whose SQL is rewritten: deferred or no transaction, unguarded consume."""
+
+    def __init__(self, db: Any, mode: str) -> None:
+        self._db, self._mode = db, mode
+
+    def execute(self, sql: str, params: Any = ()) -> Any:
+        stmt = sql.strip()
+        if stmt.startswith("UPDATE escalations SET status = 'consumed'"):
+            sql, params = "UPDATE escalations SET status = 'consumed', consumed_at = ? WHERE id = ?", params[:2]
+        elif stmt in ("BEGIN IMMEDIATE", "COMMIT", "ROLLBACK") and self._mode == "no-transaction":
+            sql, params = "SELECT 1", ()
+        elif stmt == "BEGIN IMMEDIATE":
+            sql = "BEGIN"
+        return self._db.execute(sql, params)
+
+    def close(self) -> None:
+        self._db.close()
+
+
+@pytest.mark.parametrize("mode", ["deferred-unguarded", "no-transaction"])
+def test_widen_race_mutations_behave_as_documented(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, widen_race: None, mode: str) -> None:
+    """What the widen_race docstring says about weaker variants, measured.
+
+    deferred BEGIN + unguarded consume: one allow, the rest 'database is locked'
+    (the proxy denies those), never two allows. No transaction + unguarded consume:
+    more than one allow, which is what the concurrent-retry tests exist to catch.
+    """
+    import queue
+    import sqlite3
+    import threading
+
+    d = tmp_path / "esc"
+    s = EscalationStore(d)
+    eid = s.on_escalate("alice", "generate_wallet", H, "claims_wallet_escalate").escalation.id
+    s.approve(eid)
+    real_connect = sqlite3.connect
+    monkeypatch.setattr(sqlite3, "connect", lambda *a, **kw: _MutatedDb(real_connect(*a, **kw), mode))
+    barrier = threading.Barrier(N_RETRIES)
+    results: queue.Queue[str] = queue.Queue()
+    threads = [threading.Thread(target=_race, args=(d, barrier, results)) for _ in range(N_RETRIES)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    actions = [results.get_nowait() for _ in range(N_RETRIES)]
+    allows = actions.count("allow")
+    if mode == "deferred-unguarded":
+        assert allows == 1, actions
+        others = [a for a in actions if a != "allow"]
+        assert set(others) <= {"escalate", "error:OperationalError:database is locked"}, actions
+        assert "error:OperationalError:database is locked" in others, actions
+    else:
+        assert allows > 1, actions
 
 
 def test_consume_requires_exactly_one_row_updated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -411,9 +466,19 @@ def test_db_deleted_at_runtime_concurrent_retries_all_escalate(tmp_path: Path) -
     assert outcomes == ["escalate"] * (DELETE_RACE_TRIALS * N_RETRIES), sorted(set(outcomes))
 
 
-@pytest.mark.parametrize("ttl", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+@pytest.mark.parametrize("ttl", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0, 1e300, 9e18])
 def test_escalation_ttls_must_be_finite_and_positive(tmp_path: Path, ttl: float) -> None:
     with pytest.raises(ValueError):
         EscalationStore(tmp_path / "a", pending_ttl=ttl)
     with pytest.raises(ValueError):
         EscalationStore(tmp_path / "b", approval_ttl=ttl)
+
+
+def test_escalation_ttls_have_an_upper_bound(tmp_path: Path) -> None:
+    """A huge finite TTL is a pending/deny/approval that never expires in practice."""
+    with pytest.raises(ValueError, match=r"pending TTL must be a finite number in \(0, 86400"):
+        EscalationStore(tmp_path / "a", pending_ttl=86400.001)
+    with pytest.raises(ValueError, match=r"approval TTL must be a finite number in \(0, 3600"):
+        EscalationStore(tmp_path / "b", approval_ttl=3600.001)
+    s = EscalationStore(tmp_path / "c", pending_ttl=86400.0, approval_ttl=3600.0)
+    assert (s.pending_ttl, s.approval_ttl) == (86400.0, 3600.0)
