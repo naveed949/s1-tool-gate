@@ -18,6 +18,7 @@ This directory is the maintained source for verifying the user-facing behavior o
 - Pass tokens through `S1_AUTHORIZATION`, never on argv.
 - Every feature starts from the baseline. No feature mutates shared state, and every token is minted fresh.
 - `live-proxy` is the only feature that starts processes and uses the network. It starts and stops its own kaia-mcp and proxies inside one drive. Its tokens come from kaia-mcp's demo IdP, not the TEST-ONLY kit.
+- `wallet-escalation` creates an empty escalation queue under the run's scratch dir (`/tmp/s1-verify-<run-id>/escalations`). Cleanup removes it.
 
 ## Proof and skip reporting
 
@@ -25,6 +26,7 @@ This directory is the maintained source for verifying the user-facing behavior o
 - A decision proof is the literal `choice` plus `reasonCode`. For the demo, the proof also includes the observed `sideEffect` and the wallet stub call count.
 - No minted token may appear in evidence.
 - Report an unreachable entry point with the command tried and the unmet precondition. Do not count a skipped entry point as verified through another path.
+- `live-proxy`'s `allow-read` is the only check allowed to report `SKIP` (Kaia RPC unreachable). Report it as skipped, with its `skipReason`, and not as verified. The deterministic allow path is `allow-encode`.
 
 ## Feature entry contract
 
@@ -39,6 +41,10 @@ Each feature file starts with an H1 and one paragraph. Then come exactly four H2
 
 - [Scope mapping](./scope-mapping.md): a verified token's scopes allow mapped kaia tools and deny unmapped scopes and unknown tools.
 - [Token validation](./token-validation.md): missing, malformed, expired, wrong-audience, wrong-issuer, forged, and missing-claim tokens fail closed.
-- [Wallet escalation](./wallet-escalation.md): `generate_wallet` escalates (or denies) and is never allowed.
+- [Wallet escalation](./wallet-escalation.md): `generate_wallet` escalates (or denies) and is never allowed by policy alone. The operator `escalations` CLI reads the queue and fails closed on unknown ids or a missing queue dir.
 - [kaia enforcement demo](./kaia-enforcement-demo.md): the 22 golden cases run through the gate and the enforcement seam, and the stub runs only on allow.
-- [Live proxy](./live-proxy.md): `python -m claims_gate proxy` in front of a real, running kaia-mcp. Allowed reads return chain data. Denies and wallet escalations never reach kaia-mcp. Forged, wrong-audience, expired, and revoked tokens are refused, and the proxy will not start on tool-scope drift.
+- [Live proxy](./live-proxy.md): `python -m claims_gate proxy` in front of a real, running kaia-mcp.
+  - Allowed calls go through. `encode_function_data` is the required check and works offline; the live chain read is optional.
+  - Denies and unapproved wallet escalations never reach kaia-mcp. A human-approved escalation reaches it exactly once.
+  - Forged, wrong-audience, expired, and revoked tokens are refused. A revoked token is refused once the short introspection cache entry runs out.
+  - The proxy will not start on tool-scope drift, and drift at runtime denies every `tools/call` until the maps match again.

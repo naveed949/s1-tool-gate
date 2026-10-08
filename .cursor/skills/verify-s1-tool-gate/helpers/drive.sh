@@ -89,6 +89,21 @@ case "${FEATURE}" in
     decide wallet-escalate generate_wallet "Bearer ${WALLET}" escalate claims_wallet_escalate
     decide wallet-no-scope generate_wallet "Bearer ${NOWALLET}" deny claims_insufficient_scope
     decide wallet-default-deny generate_wallet "Bearer ${WALLET}" deny claims_wallet_denied --wallet-default deny
+    # Operator side of an escalation: the queue CLI (rows are created only by the live proxy;
+    # live-proxy drives approve/deny end to end). Offline here: empty queue, bad id, no dir.
+    ESC_DIR="${INSTANCE_DIR}/escalations"
+    esc() { local name="$1" want_rc="$2"; shift 2; local rc=0
+      env -u S1_ESCALATION_DIR "${PY}" -m claims_gate escalations "$@" > "${OUT}/${name}.stdout" 2> "${OUT}/${name}.stderr" || rc=$?
+      echo "${rc}" > "${OUT}/${name}.exit"
+      if [[ "${rc}" == "${want_rc}" ]]; then echo "  ok   ${name}: escalations $* -> exit ${rc}"; else echo "  FAIL ${name}: escalations $* -> exit ${rc}, expected ${want_rc}"; FAILS=$((FAILS + 1)); fi; }
+    esc queue-list-empty 0 list --dir "${ESC_DIR}"
+    if [[ "$(tr -d '[:space:]' < "${OUT}/queue-list-empty.stdout")" != "[]" ]]; then echo "  FAIL queue-list-empty: expected []"; FAILS=$((FAILS + 1)); fi
+    esc queue-approve-unknown 1 approve no-such-id --dir "${ESC_DIR}"
+    esc queue-deny-unknown 1 deny no-such-id --dir "${ESC_DIR}"
+    esc queue-no-dir 2 list
+    if [[ "$(stat -c %a "${ESC_DIR}")" != "700" || "$(stat -c %a "${ESC_DIR}/escalations.sqlite3")" != "600" ]]; then
+      echo "  FAIL queue-perms: dir $(stat -c %a "${ESC_DIR}") file $(stat -c %a "${ESC_DIR}/escalations.sqlite3"), expected 700/600"; FAILS=$((FAILS + 1))
+    else echo "  ok   queue-perms: dir 700, sqlite 600"; fi
     ;;
   kaia-enforcement-demo)
     rc=0; "${PY}" -m claims_gate demo > "${OUT}/demo-report.json" || rc=$?
@@ -137,19 +152,30 @@ try:
     s = json.load(open(f"{out}/summary.json"))
 except OSError:
     print(f"  FAIL live-proxy: no summary.json (exit {rc}); see {out}/live-e2e.stdout"); sys.exit(1)
-want = ["initialize-through-proxy", "allow-read", "encode-denied", "wallet-escalated", "forged-denied",
-        "wrong-aud-denied", "introspection-down", "revoked-denied", "drift-refused-missing",
-        "drift-refused-changed", "expired-denied", "audit-denies-never-forwarded", "no-token-in-logs"]
+want = ["initialize-through-proxy", "encode-denied", "wallet-escalated", "escalation-approved-once",
+        "escalation-denied", "forged-denied", "wrong-aud-denied", "introspection-down", "allow-encode",
+        "revoked-denied", "drift-refused-missing", "drift-refused-changed", "drift-runtime-fail-closed",
+        "allow-read", "expired-denied", "audit-denies-never-forwarded", "no-token-in-logs"]
+# Only allow-read (needs the public Kaia RPC) may SKIP; every other check must PASS.
+optional = {"allow-read"}
 got = {c["check"]: c for c in s["checks"]}
 problems = [f"missing check {w}" for w in want if w not in got]
-problems += [f"{c['check']} failed" for c in s["checks"] if not c["ok"]]
-if rc != 0: problems.append(f"exit {rc}")
+skips = []
 for c in s["checks"]:
-    print(f"  {'ok  ' if c['ok'] else 'FAIL'} {c['check']}")
+    result = c.get("result", "PASS" if c.get("ok") else "FAIL")
+    if result == "SKIP" and c["check"] in optional:
+        skips.append(c["check"])
+        print(f"  skip {c['check']} (optional; environment): {c.get('skipReason')}")
+        continue
+    if result != "PASS":
+        problems.append(f"{c['check']} {'skipped (required)' if result == 'SKIP' else 'failed'}")
+    print(f"  {'ok  ' if result == 'PASS' else 'FAIL'} {c['check']}")
+if rc != 0: problems.append(f"exit {rc}")
 if problems:
     print("  FAIL live-proxy: " + "; ".join(problems)); sys.exit(1)
 k = s["meta"]["kaia"]
-print(f"  ok   live-proxy: {s['summary']['passed']}/{s['summary']['total']} checks against kaia-mcp {k['rev']} ({'local ' + k['dir'] if k['ref'] is None else 'clone'})")
+t = s["summary"]
+print(f"  ok   live-proxy: {t['passed']}/{t['total']} checks passed, {len(skips)} optional skipped {skips} against kaia-mcp {k['rev']} ({'local ' + k['dir'] if k['ref'] is None else 'clone'})")
 PY
     then :; else FAILS=$((FAILS + 1)); fi
     ;;

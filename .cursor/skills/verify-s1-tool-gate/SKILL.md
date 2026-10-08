@@ -1,13 +1,13 @@
 ---
 name: verify-s1-tool-gate
-description: Verify s1-tool-gate's OIDC/OAuth claims gate (packages/claims-gate) by driving its CLI with run-time TEST-ONLY JWTs against the kaia-mcp tool/scope fixture, and its live reverse proxy in front of a real kaia-mcp. Use when proving claim-to-policy decisions (allow, deny-by-scope, expired, wrong audience/issuer, forged, unauthenticated), wallet escalation, the gate-in-front-of-enforcement demo, or live proxy enforcement (introspection revocation, drift refusal, nothing denied reaches kaia-mcp).
+description: Verify s1-tool-gate's OIDC/OAuth claims gate (packages/claims-gate) by driving its CLI with run-time TEST-ONLY JWTs against the kaia-mcp tool/scope fixture, and its live reverse proxy in front of a real kaia-mcp. Use when proving claim-to-policy decisions (allow, deny-by-scope, expired, wrong audience/issuer, forged, unauthenticated), wallet escalation, the gate-in-front-of-enforcement demo, or live proxy enforcement (escalation queue approve-once/deny, introspection revocation and its cache window, startup and runtime tool-scope drift, nothing denied reaches kaia-mcp).
 ---
 
 # Verify s1-tool-gate (claims gate)
 
 Primary surface: the `python -m claims_gate` CLI (`tools`, `testkit`, `decide`, `demo`, `proxy`). A partner integration calls the same `ClaimsGate.evaluate` that `decide` wraps. Other surfaces are not driven here. The Nimble gate client needs live Ollama. The TypeScript authority-flip harness and `e2e-demo` have their own tests and `runs/`.
 
-The decision CLI is short-lived, with no server or port. The `live-proxy` feature is the exception. Its drive runs `packages/claims-gate/e2e/live_kaia.py`, which starts kaia-mcp and several proxies on ephemeral `127.0.0.1` ports and stops them before it returns. kaia-mcp comes from `S1_VERIFY_KAIA_DIR` (or `KAIA_MCP_DIR`) as a local checkout, or else from a clone of the commit pinned in the script. It needs `git`, `node>=20`, `npm`, and egress to GitHub and the Kaia public RPC. Each run gets its own scratch dir `/tmp/s1-verify-<run-id>/`, holding a TEST-ONLY RSA key and its `jwks.json`. Two runs can coexist if their run ids differ. They share the repo `.venv` (override with `S1_VERIFY_VENV`).
+The decision CLI is short-lived, with no server or port. The `live-proxy` feature is the exception. Its drive runs `packages/claims-gate/e2e/live_kaia.py`, which starts kaia-mcp and several proxies on ephemeral `127.0.0.1` ports and stops them before it returns. kaia-mcp comes from `S1_VERIFY_KAIA_DIR` (or `KAIA_MCP_DIR`) as a local checkout, or else from a clone of the commit pinned in the script. It needs `git`, `node>=20`, and `npm`, plus GitHub egress when it clones. The Kaia public RPC is used only by the optional `allow-read` check. That check SKIPs when the RPC is unreachable. Each run gets its own scratch dir `/tmp/s1-verify-<run-id>/`, holding a TEST-ONLY RSA key and its `jwks.json`. Two runs can coexist if their run ids differ. They share the repo `.venv` (override with `S1_VERIFY_VENV`).
 
 ## Launch
 
@@ -39,7 +39,7 @@ Doctor is read-only. It requires all of these:
 - `claims_gate` imports from this checkout's `packages/claims-gate/src`, not a stale install elsewhere.
 - `gate_enforcement` imports.
 - The kaia fixture reports source `...253d6c8:src/auth/scopes.ts`, 26 tools, and wallet tools `["generate_wallet"]`.
-- `python -m claims_gate proxy --help` works.
+- `python -m claims_gate proxy --help` and `python -m claims_gate escalations --help` work.
 
 Doctor also prints the `live-proxy` prerequisites (`node`, `npm`, `git`, and the kaia-mcp source). It does not fail on them, because the other features do not need them.
 
@@ -65,13 +65,13 @@ Stable handles:
 - Scopes are `kaia:read`, `kaia:encode`, `kaia:wallet`.
 - Reason codes are the `claims_*` values in `packages/claims-gate/README.md`.
 
-`live-proxy` is the deployment path. A device-flow login against kaia-mcp's demo IdP produces a real kaia JWT. MCP JSON-RPC then goes through the proxy, and the drive asserts all 13 checks in `summary.json`.
+`live-proxy` is the deployment path. A device-flow login against kaia-mcp's demo IdP produces a real kaia JWT. MCP JSON-RPC then goes through the proxy, and the drive asserts all 17 checks in `summary.json`. Each check must have `result: PASS`. The one exception is `allow-read` (a live chain read), which may be `SKIP` when the Kaia RPC is unreachable. The drive prints it as `skip` and still passes. A required check can never SKIP.
 
 Follow every entry point listed in the matching `features/` file.
 
 ## Evidence
 
-Named location: `.cursor/skills/verify-s1-tool-gate/evidence/<run-id>/<feature>/` (gitignored). Each case writes `<case>.json`, the exact `decide` stdout, and `<case>.exit`, the exit code. The demo feature writes `demo-report.json` and `demo-report-wallet-deny.json`. `live-proxy` writes `summary.json`, `kaia-mcp.log`, `proxy-*.log`, `audit-*.jsonl`, `setup.log`, `live-e2e.stdout`, and `live-e2e.exit`.
+Named location: `.cursor/skills/verify-s1-tool-gate/evidence/<run-id>/<feature>/` (gitignored). Each case writes `<case>.json`, the exact `decide` stdout, and `<case>.exit`, the exit code. The demo feature writes `demo-report.json` and `demo-report-wallet-deny.json`. `wallet-escalation` also writes `queue-*.{stdout,stderr,exit}` for the escalation-queue CLI. `live-proxy` writes `summary.json`, `kaia-mcp.log`, `proxy-*.log`, `audit-*.jsonl`, `escalations.json` (final queue rows), `escalations-cli.log`, `setup.log`, `live-e2e.stdout`, and `live-e2e.exit`.
 
 Proof standards:
 - Drive the CLI the way a partner would: a real signed JWT, verified against the JWKS. Do not call `ToolPolicy.decide` with hand-built `VerifiedClaims` as a substitute.
@@ -79,7 +79,7 @@ Proof standards:
 - Tokens never go into evidence. `drive.sh` searches every evidence file for every token it minted and fails on any match.
 - In the CLI features, the JWTs and keys are TEST-ONLY. They are created at run time and deleted by cleanup. No network or real IdP is involved, and the issuer uses the `.invalid` TLD.
 - In `live-proxy`, tokens come from kaia-mcp's in-process demo IdP. Its signing key lives only in that process. The introspection secret is random per run and is never written to evidence. The e2e's `no-token-in-logs` check scans every log for each token and the secret.
-- "Never reached kaia-mcp" is proven from kaia-mcp's own log: there must be zero `msg=Tool call tool=<name>` lines for that tool. The proxy's audit `forwarded=false` is not enough on its own.
+- "Never reached kaia-mcp" is proven from kaia-mcp's own log: there must be zero `msg=Tool call tool=<name>` lines for that tool. The proxy's audit `forwarded=false` is not enough on its own. In the same way, "an approved escalation reached kaia-mcp exactly once" means exactly one `tool=generate_wallet` line.
 
 After cleanup, confirm `evidence/<run-id>/` still exists.
 
